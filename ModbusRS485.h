@@ -30,9 +30,60 @@
 // Includes
 // ######################################################################################
 
-#include <vector>
+/* Match the platform convention used by Serial_STM32. */
+#if defined(__linux__) || defined(_WIN32) && !defined(__CC_ARM) && !defined(__ARMCOMPILER_VERSION)
+    #define _PLATFORM_PC_
+#endif
+
 #include <cstdint>
-#include <string>
+#include <cstddef>
+#include <cstring>
+
+#if defined(_PLATFORM_PC_)
+    #include <vector>
+    #include <string>
+    template <typename T> using ModbusBuffer = std::vector<T>;
+#else
+    template <typename T> struct ModbusBufferCapacity { enum { value = 256 }; };
+    template <> struct ModbusBufferCapacity<uint8_t> { enum { value = 256 }; };
+    template <> struct ModbusBufferCapacity<uint16_t> { enum { value = 123 }; };
+    template <> struct ModbusBufferCapacity<bool> { enum { value = 1968 }; };
+
+    /** Fixed-capacity, allocation-free vector-like buffer used by the MCU backend. */
+    template <typename T> class ModbusBuffer
+    {
+    public:
+        typedef T* iterator;
+        typedef const T* const_iterator;
+        ModbusBuffer() : size_(0) {}
+        template <typename It> ModbusBuffer(It first, It last) : size_(0) { insert(end(), first, last); }
+        size_t size() const { return size_; }
+        bool empty() const { return size_ == 0; }
+        T* data() { return data_; }
+        const T* data() const { return data_; }
+        iterator begin() { return data_; }
+        const_iterator begin() const { return data_; }
+        iterator end() { return data_ + size_; }
+        const_iterator end() const { return data_ + size_; }
+        T& operator[](size_t i) { return data_[i]; }
+        const T& operator[](size_t i) const { return data_[i]; }
+        void reserve(size_t) {}
+        void clear() { size_ = 0; }
+        void push_back(const T& v) { if (size_ < capacity()) data_[size_++] = v; }
+        void resize(size_t n) { resize(n, T()); }
+        void resize(size_t n, const T& value) { if (n > capacity()) n = capacity(); while (size_ < n) data_[size_++] = value; size_ = n; }
+        iterator insert(iterator pos, const T& value) { size_t i = static_cast<size_t>(pos - begin()); if (size_ >= capacity()) return end(); for (size_t j=size_; j>i; --j) data_[j]=data_[j-1]; data_[i]=value; ++size_; return begin()+i; }
+        template <typename It> iterator insert(iterator pos, It first, It last) { size_t i=static_cast<size_t>(pos-begin()); while(first!=last && size_<capacity()) { insert(begin()+i, *first++); ++i; } return begin()+i; }
+        static size_t capacity() { return ModbusBufferCapacity<T>::value; }
+    private:
+        T data_[ModbusBufferCapacity<T>::value];
+        size_t size_;
+    };
+#endif
+
+#if !defined(_PLATFORM_PC_)
+    #include "Serial.h"
+#endif
 
 // ######################################################################################
 // Modbus class
@@ -68,7 +119,8 @@ class Modbus
          * @warning Not thread-safe: if multiple threads call methods concurrently,
          *          errorMessage may be overwritten.
          */
-        std::string errorMessage; 
+        static constexpr uint16_t ERROR_MESSAGE_CAPACITY = 96;
+        char errorMessage[ERROR_MESSAGE_CAPACITY];
 
         /**
          * @brief Serial parity configuration.
@@ -99,7 +151,9 @@ class Modbus
              *
              * @note Example: "/dev/ttyUSB0"
              */
-            std::string PORT;     
+            #if defined(_PLATFORM_PC_)
+                std::string PORT;
+            #endif
 
             /**
              * @brief Baud rate for serial communication.
@@ -151,6 +205,12 @@ class Modbus
          * and then call @ref openPort().
          */
         Modbus();
+
+        #if !defined(_PLATFORM_PC_)
+            /** Attach project Serial object and RS-485 direction GPIO. TX level means transmit. */
+            bool begin(Serial* serial, GPIO_TypeDef* directionPort, uint16_t directionPin,
+                        GPIO_PinState transmitLevel = GPIO_PIN_SET);
+        #endif
         
         /**
          * @brief Destructor.
@@ -193,6 +253,9 @@ class Modbus
          */
         bool isPortOpen() const noexcept;
 
+        /** Copy error text into the fixed-size, always null-terminated error buffer. */
+        void setError(const char* message) noexcept;
+
         // -------------------------------------------------------------------------
         // Modbus Read Operations
         // -------------------------------------------------------------------------
@@ -210,7 +273,7 @@ class Modbus
          *         Bits are packed LSB-first per Modbus specification.
          *         Returns an empty vector on failure and sets @ref errorMessage.
          */
-        std::vector<uint8_t> readCoils(uint8_t slaveID, uint16_t starting_address, uint16_t quantity);
+        ModbusBuffer<uint8_t> readCoils(uint8_t slaveID, uint16_t starting_address, uint16_t quantity);
 
         /**
          * @brief Read discrete inputs (Function Code 0x02).
@@ -225,7 +288,7 @@ class Modbus
          *         Bits are packed LSB-first per Modbus specification.
          *         Returns an empty vector on failure and sets @ref errorMessage.
          */
-        std::vector<uint8_t> readDiscreteInputs(uint8_t slaveID, uint16_t starting_address, uint16_t quantity);
+        ModbusBuffer<uint8_t> readDiscreteInputs(uint8_t slaveID, uint16_t starting_address, uint16_t quantity);
 
         /**
          * @brief Read holding registers (Function Code 0x03).
@@ -241,7 +304,7 @@ class Modbus
          *         length = `quantity * 2`, big-endian per register (Hi byte then Lo byte).
          *         Returns an empty vector on failure and sets @ref errorMessage.
          */
-        std::vector<uint8_t> readHoldingRegisters(uint8_t slaveID, uint16_t starting_address, uint16_t quantity);
+        ModbusBuffer<uint8_t> readHoldingRegisters(uint8_t slaveID, uint16_t starting_address, uint16_t quantity);
 
         /**
          * @brief Read holding registers (Function Code 0x03) into a caller-provided buffer.
@@ -271,7 +334,7 @@ class Modbus
          *         length = `quantity * 2`, big-endian per register (Hi byte then Lo byte).
          *         Returns an empty vector on failure and sets @ref errorMessage.
          */
-        std::vector<uint8_t> readInputRegisters(uint8_t slaveID, uint16_t starting_address, uint16_t quantity);
+        ModbusBuffer<uint8_t> readInputRegisters(uint8_t slaveID, uint16_t starting_address, uint16_t quantity);
 
         /**
          * @brief Read input registers (Function Code 0x04) into a caller-provided buffer.
@@ -334,7 +397,7 @@ class Modbus
          * @note Modbus packs coil bits LSB-first into bytes. The implementation must pack
          *       @p values accordingly.
          */
-        bool writeMultipleCoils(uint8_t slaveID, uint16_t starting_address, const std::vector<bool>& values);
+        bool writeMultipleCoils(uint8_t slaveID, uint16_t starting_address, const ModbusBuffer<bool>& values);
 
         /**
          * @brief Write multiple holding registers (Function Code 0x10).
@@ -349,7 +412,7 @@ class Modbus
          *
          * @note Modbus specifies a maximum of 123 registers per 0x10 request.
          */
-        bool writeMultipleRegisters(uint8_t slaveID, uint16_t starting_address, const std::vector<uint16_t>& values);
+        bool writeMultipleRegisters(uint8_t slaveID, uint16_t starting_address, const ModbusBuffer<uint16_t>& values);
 
         /**
          * @brief Write multiple holding registers (Function Code 0x10) using a raw array.
@@ -380,7 +443,7 @@ class Modbus
          *
          * @note Consider making this function static if it does not access object state.
          */
-        static void printHex(const std::vector<uint8_t>& data); 
+        static void printHex(const ModbusBuffer<uint8_t>& data); 
 
     private:
 
@@ -390,13 +453,19 @@ class Modbus
          * A value < 0 indicates that the port is not open.
          */
         int _serialPort{-1};
+        #if !defined(_PLATFORM_PC_)
+            Serial* _serial{nullptr};
+            GPIO_TypeDef* _directionPort{nullptr};
+            uint16_t _directionPin{0};
+            GPIO_PinState _transmitLevel{GPIO_PIN_SET};
+        #endif
 
         /**
          * @brief Compute Modbus RTU CRC16 over a byte vector.
          * @param data Input frame bytes (excluding CRC bytes).
          * @return CRC16 value.
          */
-        static uint16_t _crc16_modbus(const std::vector<uint8_t>& data);
+        static uint16_t _crc16_modbus(const ModbusBuffer<uint8_t>& data);
 
         /**
          * @brief Compute Modbus RTU CRC16 over a byte buffer.
@@ -412,7 +481,7 @@ class Modbus
          * @param frame Complete frame including CRC bytes.
          * @return true if CRC is valid; false otherwise.
          */
-        static bool _verifyCrc(const std::vector<uint8_t>& frame);
+        static bool _verifyCrc(const ModbusBuffer<uint8_t>& frame);
 
         /**
          * @brief Append Modbus RTU CRC16 to the end of a frame.
@@ -421,7 +490,7 @@ class Modbus
          *
          * @param frame Frame to append CRC onto.
          */
-        static void _appendCrc(std::vector<uint8_t>& frame);
+        static void _appendCrc(ModbusBuffer<uint8_t>& frame);
 
         // -------------------------------------------------------------------------
         // Address normalization helpers (optional)
@@ -469,7 +538,7 @@ class Modbus
          * @param data Vector containing the full Modbus RTU frame (including CRC).
          * @return true if transmission succeeded; false otherwise (see @ref errorMessage).
          */
-        bool _serialSend(const std::vector<uint8_t>& data);
+        bool _serialSend(const ModbusBuffer<uint8_t>& data);
 
         /**
          * @brief Send a complete Modbus RTU frame over the serial port.
@@ -494,7 +563,7 @@ class Modbus
          *         Returns an empty vector on failure (timeout or I/O error) and sets
          *         @ref errorMessage.
          */
-        std::vector<uint8_t> _serialReceive(size_t n, uint32_t timeout_ms = 1000);
+        ModbusBuffer<uint8_t> _serialReceive(size_t n, uint32_t timeout_ms = 1000);
 
         /**
          * @brief Read up to @p expected_length bytes into a caller-provided buffer.
@@ -535,7 +604,7 @@ class Modbus
          * @return Full Modbus RTU response frame including CRC on success.
          *         Returns empty vector on failure and sets @ref errorMessage.
          */
-        std::vector<uint8_t> _receiveRtuResponse(uint8_t expected_slave, uint8_t expected_function, size_t expected_fixed_len, uint32_t timeout_ms);
+        ModbusBuffer<uint8_t> _receiveRtuResponse(uint8_t expected_slave, uint8_t expected_function, size_t expected_fixed_len, uint32_t timeout_ms);
         
         /**
          * @brief Validate slave ID, function code, and exception responses (basic checks).
@@ -552,7 +621,7 @@ class Modbus
          *
          * @return true if basic validation succeeds; false otherwise.
          */
-        bool _validateBasicResponse(const std::vector<uint8_t>& resp, uint8_t expected_slave, uint8_t expected_function);
+        bool _validateBasicResponse(const ModbusBuffer<uint8_t>& resp, uint8_t expected_slave, uint8_t expected_function);
 };
 
 // ##############################################################################

@@ -2,28 +2,38 @@
 // ################################################################################
 // Include libraries:
 
-#include "ModbusLinuxRS485.h"
-#include <fcntl.h>              // For file control (open, close)
-#include <unistd.h>             // For read, write, sleep, usleep
-#include <errno.h>              // For error numbers
-#include <sstream>
-#include <stdexcept>            // For runtime_error
-#include <iomanip>
-#include <termios.h>            // For terminal control (termios struct, baud rates)
-#include <chrono>
-#include <poll.h>
-#include <iostream>
+#include "ModbusRS485.h"
 #include <cstring>
-#include <algorithm>
-#include <utility>     // for std::move
+#include <cstdio>
+
+#if defined(_PLATFORM_PC_)
+    #include <sstream>
+    #include <algorithm>
+    #include <utility>
+    #include <fcntl.h>              // For file control (open, close)
+    #include <unistd.h>             // For read, write, sleep, usleep
+    #include <errno.h>              // For error numbers
+    #include <stdexcept>            // For runtime_error
+    #include <iomanip>
+    #include <termios.h>            // For terminal control (termios struct, baud rates)
+    #include <chrono>
+    #include <poll.h>
+    #include <iostream>
+#else
+    #include "Serial.h"
+#endif
 
 // ################################################################################
 
 static inline uint64_t now_ms()
 {
-    struct timespec ts;
-    clock_gettime(CLOCK_MONOTONIC_RAW, &ts);
-    return (uint64_t)ts.tv_sec * 1000ULL + ts.tv_nsec / 1000000ULL;
+    #if defined(_PLATFORM_PC_)
+        struct timespec ts;
+        clock_gettime(CLOCK_MONOTONIC_RAW, &ts);
+        return (uint64_t)ts.tv_sec * 1000ULL + ts.tv_nsec / 1000000ULL;
+    #else
+        return HAL_GetTick();
+    #endif
 }
 
 // ################################################################################
@@ -35,9 +45,11 @@ static inline uint64_t now_ms()
 
 Modbus::Modbus()
 {   
-    errorMessage.clear();
+    errorMessage[0] = '\0';
 
-    parameters.PORT = "";
+    #if defined(_PLATFORM_PC_)
+        parameters.PORT = "";
+    #endif
     parameters.BAUDRATE = 9600;
     parameters.TRANSMIT_DELAY_US = 0;
     parameters.RESPONSE_TIMEOUT_MS = 1000;
@@ -50,10 +62,17 @@ Modbus::Modbus()
 
 Modbus::Modbus(Modbus&& other) noexcept
 {
-    errorMessage = std::move(other.errorMessage);
+    std::memcpy(errorMessage, other.errorMessage, sizeof(errorMessage));
     parameters   = other.parameters;
     _serialPort  = other._serialPort;
     other._serialPort = -1;
+    #if !defined(_PLATFORM_PC_)
+        _serial = other._serial;
+        _directionPort = other._directionPort;
+        _directionPin = other._directionPin;
+        _transmitLevel = other._transmitLevel;
+        other._serial = nullptr;
+    #endif
 }
 
 Modbus& Modbus::operator=(Modbus&& other) noexcept
@@ -62,35 +81,89 @@ Modbus& Modbus::operator=(Modbus&& other) noexcept
 
     closePort(); // safe cleanup
 
-    errorMessage = std::move(other.errorMessage);
+    std::memcpy(errorMessage, other.errorMessage, sizeof(errorMessage));
     parameters   = other.parameters;
     _serialPort  = other._serialPort;
     other._serialPort = -1;
+    #if !defined(_PLATFORM_PC_)
+        _serial = other._serial;
+        _directionPort = other._directionPort;
+        _directionPin = other._directionPin;
+        _transmitLevel = other._transmitLevel;
+        other._serial = nullptr;
+    #endif
     return *this;
 }
 
 Modbus::~Modbus()
 {
-    if (_serialPort >= 0) 
-    {
-        ::close(_serialPort);
-        _serialPort = -1;
-    }
+    #if defined(_PLATFORM_PC_)
+        if (_serialPort >= 0) 
+        {
+            ::close(_serialPort);
+            _serialPort = -1;
+        }
+    #endif
 }
 
 void Modbus::closePort() noexcept
 {
-    if (_serialPort >= 0)
-    {
-        ::close(_serialPort);
-        _serialPort = -1;
-    }
+    #if defined(_PLATFORM_PC_)
+        if (_serialPort >= 0)
+        {
+            ::close(_serialPort);
+            _serialPort = -1;
+        }
+    #endif
+}
+
+void Modbus::setError(const char* message) noexcept
+{
+    if (message == nullptr) message = "";
+    std::strncpy(errorMessage, message, sizeof(errorMessage) - 1);
+    errorMessage[sizeof(errorMessage) - 1] = '\0';
 }
 
 bool Modbus::isPortOpen() const noexcept
 { 
-    return (_serialPort >= 0); 
+    #if defined(_PLATFORM_PC_)
+        return (_serialPort >= 0); 
+    #else
+        return _serial != nullptr;
+    #endif
 }
+
+#if !defined(_PLATFORM_PC_)
+    bool Modbus::begin(Serial* serial, GPIO_TypeDef* directionPort, uint16_t directionPin,
+                        GPIO_PinState transmitLevel)
+    {
+        if (serial == nullptr || serial->getUart() == nullptr ||
+            directionPort == nullptr || directionPin == 0)
+        {
+            setError("Invalid Serial or DE pin.");
+            return false;
+        }
+        if (!serial->setTxMode(PROGRAM_MODE_BLOCK) || !serial->setRxMode(PROGRAM_MODE_BLOCK))
+        {
+            setError("Serial blocking mode failed.");
+            return false;
+        }
+        _serial = serial;
+        _directionPort = directionPort;
+        _directionPin = directionPin;
+        _transmitLevel = transmitLevel;
+        if (!serial->begin(serial->getUart(), parameters.BAUDRATE))
+        {
+            _serial = nullptr;
+            setError("Serial begin failed.");
+            return false;
+        }
+        serial->setTimeout(parameters.RESPONSE_TIMEOUT_MS);
+        HAL_GPIO_WritePin(_directionPort, _directionPin,
+                        transmitLevel == GPIO_PIN_SET ? GPIO_PIN_RESET : GPIO_PIN_SET);
+        return true;
+    }
+#endif
 
 // ------------------------
 // Port open/config
@@ -98,136 +171,141 @@ bool Modbus::isPortOpen() const noexcept
 
 bool Modbus::openPort(void)
 {
-    if (parameters.PORT.empty())
-    {
-        errorMessage = "Serial PORT is empty.";
-        return false;
-    }
-
-    speed_t baud_rate;
-    switch (parameters.BAUDRATE) 
-    {
-        case 9600: baud_rate = B9600; break;
-        case 19200: baud_rate = B19200; break;
-        case 38400: baud_rate = B38400; break;
-        case 57600: baud_rate = B57600; break;
-        case 115200: baud_rate = B115200; break;
-        default: 
-            errorMessage = "Baud rate is not valid.";
+    #if !defined(_PLATFORM_PC_)
+        if (!isPortOpen()) setError("Call begin() with Serial and RS485 DE pin on STM32.");
+        return isPortOpen();
+    #else
+        if (parameters.PORT.empty())
+        {
+            setError("Serial PORT is empty.");
             return false;
-    }
+        }
 
-    // Initialization code remains the same as the working version
-    _serialPort = open(parameters.PORT.c_str(), O_RDWR | O_NOCTTY | O_NONBLOCK);
-    if (_serialPort < 0) 
-    {
-        std::ostringstream oss;
-        oss << "Error " << errno << " opening port: " << strerror(errno);
-        errorMessage = oss.str();
+        speed_t baud_rate;
+        switch (parameters.BAUDRATE) 
+        {
+            case 9600: baud_rate = B9600; break;
+            case 19200: baud_rate = B19200; break;
+            case 38400: baud_rate = B38400; break;
+            case 57600: baud_rate = B57600; break;
+            case 115200: baud_rate = B115200; break;
+            default: 
+                setError("Baud rate is not valid.");
+                return false;
+        }
 
-        return false;
-    }
+        // Initialization code remains the same as the working version
+        _serialPort = open(parameters.PORT.c_str(), O_RDWR | O_NOCTTY | O_NONBLOCK);
+        if (_serialPort < 0) 
+        {
+            std::ostringstream oss;
+            oss << "Error " << errno << " opening port: " << strerror(errno);
+            setError(oss.str().c_str());
 
-    struct termios tty;
-    memset(&tty, 0, sizeof(tty));
-    tcgetattr(_serialPort, &tty); 
+            return false;
+        }
 
-    cfsetospeed(&tty, baud_rate);
-    cfsetispeed(&tty, baud_rate);
+        struct termios tty;
+        memset(&tty, 0, sizeof(tty));
+        tcgetattr(_serialPort, &tty); 
 
-    tty.c_cflag |= (CLOCAL | CREAD);
-    tty.c_cflag &= ~CSIZE;
+        cfsetospeed(&tty, baud_rate);
+        cfsetispeed(&tty, baud_rate);
 
-    // no hw flow control
-    tty.c_cflag &= ~CRTSCTS;
+        tty.c_cflag |= (CLOCAL | CREAD);
+        tty.c_cflag &= ~CSIZE;
 
-    // Data bits
-    switch (parameters.DATA_BITS)
-    {
-        case 5: tty.c_cflag |= CS5; break;
-        case 6: tty.c_cflag |= CS6; break;
-        case 7: tty.c_cflag |= CS7; break;
-        case 8: tty.c_cflag |= CS8; break;
-        default:
-            errorMessage = "Invalid DATA_BITS (must be 5..8).";
+        // no hw flow control
+        tty.c_cflag &= ~CRTSCTS;
+
+        // Data bits
+        switch (parameters.DATA_BITS)
+        {
+            case 5: tty.c_cflag |= CS5; break;
+            case 6: tty.c_cflag |= CS6; break;
+            case 7: tty.c_cflag |= CS7; break;
+            case 8: tty.c_cflag |= CS8; break;
+            default:
+                setError("Invalid DATA_BITS (must be 5..8).");
+                ::close(_serialPort); _serialPort = -1;
+                return false;
+        }
+
+        // Stop bits
+        if (parameters.STOP_BITS == 2) tty.c_cflag |= CSTOPB;
+        else if (parameters.STOP_BITS == 1) tty.c_cflag &= ~CSTOPB;
+        else
+        {
+            setError("Invalid STOP_BITS (must be 1 or 2).");
             ::close(_serialPort); _serialPort = -1;
             return false;
-    }
+        }
 
-    // Stop bits
-    if (parameters.STOP_BITS == 2) tty.c_cflag |= CSTOPB;
-    else if (parameters.STOP_BITS == 1) tty.c_cflag &= ~CSTOPB;
-    else
-    {
-        errorMessage = "Invalid STOP_BITS (must be 1 or 2).";
-        ::close(_serialPort); _serialPort = -1;
-        return false;
-    }
+        // Parity
+        tty.c_cflag &= ~(PARENB | PARODD);
+        switch (parameters.PARITY)
+        {
+            case Parity::None:
+                // nothing
+                break;
+            case Parity::Even:
+                tty.c_cflag |= PARENB;
+                break;
+            case Parity::Odd:
+                tty.c_cflag |= PARENB;
+                tty.c_cflag |= PARODD;
+                break;
+        }
 
-    // Parity
-    tty.c_cflag &= ~(PARENB | PARODD);
-    switch (parameters.PARITY)
-    {
-        case Parity::None:
-            // nothing
-            break;
-        case Parity::Even:
-            tty.c_cflag |= PARENB;
-            break;
-        case Parity::Odd:
-            tty.c_cflag |= PARENB;
-            tty.c_cflag |= PARODD;
-            break;
-    }
+        tty.c_lflag = 0; tty.c_oflag = 0; 
 
-    tty.c_lflag = 0; tty.c_oflag = 0; 
+        // raw-ish input
+        tty.c_iflag &= ~(IGNBRK | BRKINT | PARMRK | ISTRIP |
+                        INLCR | IGNCR | ICRNL | IXON | IXOFF | IXANY);
 
-    // raw-ish input
-    tty.c_iflag &= ~(IGNBRK | BRKINT | PARMRK | ISTRIP |
-                    INLCR | IGNCR | ICRNL | IXON | IXOFF | IXANY);
+        // raw-ish output
+        tty.c_oflag &= ~OPOST;
 
-    // raw-ish output
-    tty.c_oflag &= ~OPOST;
+        // raw-ish local
+        tty.c_lflag &= ~(ECHO | ECHONL | ICANON | ISIG | IEXTEN);
 
-    // raw-ish local
-    tty.c_lflag &= ~(ECHO | ECHONL | ICANON | ISIG | IEXTEN);
+        // // VMIN=1 (wait for first byte), VTIME=10 (1 second timeout for subsequent bytes)
+        // tty.c_cc[VMIN]  = 1; 
+        // tty.c_cc[VTIME] = (cc_t)(parameters.RESPONSE_TIMEOUT_MS / 100.0); 
 
-    // // VMIN=1 (wait for first byte), VTIME=10 (1 second timeout for subsequent bytes)
-    // tty.c_cc[VMIN]  = 1; 
-    // tty.c_cc[VTIME] = (cc_t)(parameters.RESPONSE_TIMEOUT_MS / 100.0); 
+        tty.c_cc[VMIN]  = 0;
+        tty.c_cc[VTIME] = 0;
 
-    tty.c_cc[VMIN]  = 0;
-    tty.c_cc[VTIME] = 0;
+        if (tcsetattr(_serialPort, TCSANOW, &tty) != 0) 
+        {
+            std::ostringstream oss;
+            oss << "Error setting port attributes: " << strerror(errno);
+            setError(oss.str().c_str());
 
-    if (tcsetattr(_serialPort, TCSANOW, &tty) != 0) 
-    {
-        std::ostringstream oss;
-        oss << "Error setting port attributes: " << strerror(errno);
-        errorMessage = oss.str();
+            ::close(_serialPort); 
+            _serialPort = -1; 
+            return false;
+        }
 
-        ::close(_serialPort); 
-        _serialPort = -1; 
-        return false;
-    }
+        if (tcgetattr(_serialPort, &tty) != 0)
+        {
+            std::ostringstream oss;
+            oss << "Error getting port attributes: " << std::strerror(errno);
+            setError(oss.str().c_str());
+            ::close(_serialPort);
+            _serialPort = -1;
+            return false;
+        }
 
-    if (tcgetattr(_serialPort, &tty) != 0)
-    {
-        std::ostringstream oss;
-        oss << "Error getting port attributes: " << std::strerror(errno);
-        errorMessage = oss.str();
-        ::close(_serialPort);
-        _serialPort = -1;
-        return false;
-    }
-
-    return true;
+        return true;
+    #endif
 }
 
 // ------------------------
 // IO helpers
 // ------------------------
 
-bool Modbus::_serialSend(const std::vector<uint8_t>& data) 
+bool Modbus::_serialSend(const ModbusBuffer<uint8_t>& data) 
 { 
     return _serialSend(data.data(), data.size()); 
 }
@@ -236,43 +314,64 @@ bool Modbus::_serialSend(const uint8_t* data, size_t len)
 {
     if (!isPortOpen()) 
     {
-        errorMessage = "Send failed. Port is closed.";
+        setError("Send failed. Port is closed.");
         return false;
     }
 
-    // Flush stale input before request (OK for Modbus RTU).
-    tcflush(_serialPort, TCIFLUSH); 
+    #if defined(_PLATFORM_PC_)
+        // Flush stale input before request (OK for Modbus RTU).
+        tcflush(_serialPort, TCIFLUSH); 
 
-    size_t sent = 0;
-    while (sent < len)
-    {
-        ssize_t n = ::write(_serialPort, data + sent, len - sent);
-        if (n < 0)
+        size_t sent = 0;
+        while (sent < len)
         {
-            if (errno == EINTR) continue;
-            if (errno == EAGAIN) { ::usleep(1000); continue; } // tiny backoff
+            ssize_t n = ::write(_serialPort, data + sent, len - sent);
+            if (n < 0)
+            {
+                if (errno == EINTR) continue;
+                if (errno == EAGAIN) { ::usleep(1000); continue; } // tiny backoff
+                std::ostringstream oss;
+                oss << "write failed: " << std::strerror(errno);
+                setError(oss.str().c_str());
+                return false;
+            }
+            sent += static_cast<size_t>(n);
+        }
+
+        // Ensure request is physically transmitted before turnaround delay.
+        if (tcdrain(_serialPort) != 0)
+        {
             std::ostringstream oss;
-            oss << "write failed: " << std::strerror(errno);
-            errorMessage = oss.str();
+            oss << "tcdrain failed: " << std::strerror(errno);
+            setError(oss.str().c_str());
             return false;
         }
-        sent += static_cast<size_t>(n);
-    }
 
-    // Ensure request is physically transmitted before turnaround delay.
-    if (tcdrain(_serialPort) != 0)
-    {
-        std::ostringstream oss;
-        oss << "tcdrain failed: " << std::strerror(errno);
-        errorMessage = oss.str();
-        return false;
-    }
+        if (parameters.TRANSMIT_DELAY_US > 0)
+        {
+            usleep(parameters.TRANSMIT_DELAY_US); // Bus Turnaround Delay
+        }
+    #else
+        HAL_GPIO_WritePin(_directionPort, _directionPin, _transmitLevel);
+        const uint16_t written = _serial->write(const_cast<uint8_t*>(data), static_cast<uint16_t>(len));
+        if (written != len)
+        {
+            HAL_GPIO_WritePin(_directionPort, _directionPin,
+                            _transmitLevel == GPIO_PIN_SET ? GPIO_PIN_RESET : GPIO_PIN_SET);
+            setError("UART transmit failed.");
+            return false;
+        }
+        if (!_serial->flush(parameters.RESPONSE_TIMEOUT_MS))
+        {
+            HAL_GPIO_WritePin(_directionPort, _directionPin,
+                            _transmitLevel == GPIO_PIN_SET ? GPIO_PIN_RESET : GPIO_PIN_SET);
+            setError("UART transmit timeout.");
+            return false;
+        }
+        HAL_GPIO_WritePin(_directionPort, _directionPin,
+                        _transmitLevel == GPIO_PIN_SET ? GPIO_PIN_RESET : GPIO_PIN_SET);
+    #endif
 
-    if (parameters.TRANSMIT_DELAY_US > 0)
-    {
-        usleep(parameters.TRANSMIT_DELAY_US); // Bus Turnaround Delay
-    }
-    
     return true;
 }
 
@@ -280,144 +379,164 @@ size_t Modbus::_serialReceive(size_t expected_length, uint8_t* buffer)
 {
     if (!isPortOpen())
     {
-        errorMessage = "Receive failed, port is closed.";
+        setError("Receive failed, port is closed.");
         return 0;
     }
 
-    ssize_t n = ::read(_serialPort, buffer, expected_length);
+    #if defined(_PLATFORM_PC_)
+        ssize_t n = ::read(_serialPort, buffer, expected_length);
 
-    if (n > 0) return static_cast<size_t>(n);
+        if (n > 0) return static_cast<size_t>(n);
 
-    if (n == 0)
-    {
-        errorMessage = "Serial read returned 0 bytes.";
+        if (n == 0)
+        {
+            setError("Serial read returned 0 bytes.");
+            return 0;
+        }
+
+        // n < 0
+        if (errno == EINTR) return 0; // caller may retry
+        if (errno == EAGAIN || errno == EWOULDBLOCK) return 0; // no data yet (non-blocking)
+
+        std::ostringstream oss;
+        oss << "Error reading serial data: " << std::strerror(errno);
+        setError(oss.str().c_str());
         return 0;
-    }
-
-    // n < 0
-    if (errno == EINTR) return 0; // caller may retry
-    if (errno == EAGAIN || errno == EWOULDBLOCK) return 0; // no data yet (non-blocking)
-
-    std::ostringstream oss;
-    oss << "Error reading serial data: " << std::strerror(errno);
-    errorMessage = oss.str();
-    return 0;
+    #else
+        _serial->setTimeout(parameters.RESPONSE_TIMEOUT_MS);
+        const size_t received = _serial->readBytes(reinterpret_cast<char*>(buffer), expected_length);
+        if (received == expected_length) return received;
+        setError("UART receive timeout.");
+        return 0;
+    #endif
 }
 
-std::vector<uint8_t> Modbus::_serialReceive(size_t n, uint32_t timeout_ms)
+ModbusBuffer<uint8_t> Modbus::_serialReceive(size_t n, uint32_t timeout_ms)
 {
     if (!isPortOpen())
     {
-        errorMessage = "Receive failed: port is closed.";
+        setError("Receive failed: port is closed.");
         return {};
     }
 
-    std::vector<uint8_t> out;
-    out.reserve(n);
+    #if defined(_PLATFORM_PC_)
+        ModbusBuffer<uint8_t> out;
+        out.reserve(n);
 
-    const int fd = _serialPort;
+        const int fd = _serialPort;
 
-    const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms);
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms);
 
-    while (out.size() < n)
-    {
-        auto now = std::chrono::steady_clock::now();
-        if (now >= deadline)
+        while (out.size() < n)
         {
-            std::ostringstream oss;
-            oss << "Timeout while reading (" << timeout_ms << " ms total).";
-            errorMessage = oss.str();
-            return {};
+            auto now = std::chrono::steady_clock::now();
+            if (now >= deadline)
+            {
+                std::ostringstream oss;
+                oss << "Timeout while reading (" << timeout_ms << " ms total).";
+                setError(oss.str().c_str());
+                return {};
+            }
+
+            int remaining = (int)std::chrono::duration_cast<std::chrono::milliseconds>(deadline - now).count();
+            if (remaining <= 0) remaining = 1;
+
+            pollfd pfd{};
+            pfd.fd = fd;
+            pfd.events = POLLIN;
+
+            int rc = ::poll(&pfd, 1, remaining);
+            if (rc == 0)
+            {
+                std::ostringstream oss;
+                oss << "Timeout while reading (" << timeout_ms << " ms total).";
+                setError(oss.str().c_str());
+                return {};
+            }
+            if (rc < 0)
+            {
+                if (errno == EINTR) continue;
+                std::ostringstream oss;
+                oss << "poll failed: " << std::strerror(errno);
+                setError(oss.str().c_str());
+                return {};
+            }
+
+            if (pfd.revents & (POLLERR | POLLHUP | POLLNVAL))
+            {
+                setError("Serial port error/hangup while reading.");
+                return {};
+            }
+
+            uint8_t buf[256];
+            const size_t want = std::min(sizeof(buf), n - out.size());
+
+            ssize_t got = ::read(fd, buf, want);
+            if (got < 0)
+            {
+                if (errno == EINTR) continue;
+                if (errno == EAGAIN) continue;
+                std::ostringstream oss;
+                oss << "read failed: " << std::strerror(errno);
+                setError(oss.str().c_str());
+                return {};
+            }
+            if (got == 0) continue;
+
+            out.insert(out.end(), buf, buf + got);
         }
 
-        int remaining = (int)std::chrono::duration_cast<std::chrono::milliseconds>(deadline - now).count();
-        if (remaining <= 0) remaining = 1;
-
-        pollfd pfd{};
-        pfd.fd = fd;
-        pfd.events = POLLIN;
-
-        int rc = ::poll(&pfd, 1, remaining);
-        if (rc == 0)
+        return out;
+    #else
+        ModbusBuffer<uint8_t> out(n);
+        _serial->setTimeout(timeout_ms);
+        const size_t received = _serial->readBytes(reinterpret_cast<char*>(out.data()), n);
+        if (received != n)
         {
-            std::ostringstream oss;
-            oss << "Timeout while reading (" << timeout_ms << " ms total).";
-            errorMessage = oss.str();
+            setError("UART receive timeout.");
             return {};
         }
-        if (rc < 0)
-        {
-            if (errno == EINTR) continue;
-            std::ostringstream oss;
-            oss << "poll failed: " << std::strerror(errno);
-            errorMessage = oss.str();
-            return {};
-        }
-
-        if (pfd.revents & (POLLERR | POLLHUP | POLLNVAL))
-        {
-            errorMessage = "Serial port error/hangup while reading.";
-            return {};
-        }
-
-        uint8_t buf[256];
-        const size_t want = std::min(sizeof(buf), n - out.size());
-
-        ssize_t got = ::read(fd, buf, want);
-        if (got < 0)
-        {
-            if (errno == EINTR) continue;
-            if (errno == EAGAIN) continue;
-            std::ostringstream oss;
-            oss << "read failed: " << std::strerror(errno);
-            errorMessage = oss.str();
-            return {};
-        }
-        if (got == 0) continue;
-
-        out.insert(out.end(), buf, buf + got);
-    }
-
-    return out;
+        return out;
+    #endif
 }
 
-bool Modbus::_validateBasicResponse(const std::vector<uint8_t>& resp,
+bool Modbus::_validateBasicResponse(const ModbusBuffer<uint8_t>& resp,
                                   uint8_t expected_slave,
                                   uint8_t expected_function)
 {
     if (resp.size() < 5)
     {
-        errorMessage = "Response too short.";
+        setError("Response too short.");
         return false;
     }
     if (resp[0] != expected_slave)
     {
-        errorMessage = "Slave ID mismatch.";
+        setError("Slave ID mismatch.");
         return false;
     }
     // Exception response?
     if (resp[1] == static_cast<uint8_t>(expected_function | 0x80))
     {
-        std::ostringstream oss;
-        oss << "Modbus exception, code=0x" << std::hex << std::uppercase
-            << static_cast<int>(resp[2]);
-        errorMessage = oss.str();
+        char message[32];
+        std::snprintf(message, sizeof(message), "Modbus exception, code=0x%02X",
+                      static_cast<unsigned int>(resp[2]));
+        setError(message);
         return false;
     }
     if (resp[1] != expected_function)
     {
-        errorMessage = "Function code mismatch.";
+        setError("Function code mismatch.");
         return false;
     }
     if (!_verifyCrc(resp))
     {
-        errorMessage = "CRC mismatch in response.";
+        setError("CRC mismatch in response.");
         return false;
     }
     return true;
 }
 
-std::vector<uint8_t> Modbus::_receiveRtuResponse(uint8_t expected_slave,
+ModbusBuffer<uint8_t> Modbus::_receiveRtuResponse(uint8_t expected_slave,
                                                 uint8_t expected_function,
                                                 size_t expected_fixed_len,
                                                 uint32_t timeout_ms)
@@ -438,7 +557,7 @@ std::vector<uint8_t> Modbus::_receiveRtuResponse(uint8_t expected_slave,
     if (expected_fixed_len != 0)
     {
         uint32_t rem = remaining_ms();
-        if (rem == 0) { errorMessage = "Timeout before reading fixed response."; return {}; }
+        if (rem == 0) { setError("Timeout before reading fixed response."); return {}; }
 
         auto resp = _serialReceive(expected_fixed_len, rem);
         if (resp.empty()) return {};
@@ -447,7 +566,7 @@ std::vector<uint8_t> Modbus::_receiveRtuResponse(uint8_t expected_slave,
     }
 
     uint32_t rem = remaining_ms();
-    if (rem == 0) { errorMessage = "Timeout waiting for response header."; return {}; }
+    if (rem == 0) { setError("Timeout waiting for response header."); return {}; }
 
     // Variable-length: read first 2 bytes to detect exception, then 3rd byte (byte-count) for normal response.
     auto first2 = _serialReceive(2, rem);
@@ -457,11 +576,11 @@ std::vector<uint8_t> Modbus::_receiveRtuResponse(uint8_t expected_slave,
     if (first2.size() == 2 && first2[1] == static_cast<uint8_t>(expected_function | 0x80))
     {
         rem = remaining_ms();
-        if (rem == 0) { errorMessage = "Timeout waiting for exception tail."; return {}; }
+        if (rem == 0) { setError("Timeout waiting for exception tail."); return {}; }
 
         auto rest3 = _serialReceive(3, rem);
         if (rest3.empty()) return {};
-        std::vector<uint8_t> resp;
+        ModbusBuffer<uint8_t> resp;
         resp.reserve(5);
         resp.insert(resp.end(), first2.begin(), first2.end());
         resp.insert(resp.end(), rest3.begin(), rest3.end());
@@ -473,7 +592,7 @@ std::vector<uint8_t> Modbus::_receiveRtuResponse(uint8_t expected_slave,
     // Normal response: need 3rd byte = byte count
 
     rem = remaining_ms();
-    if (rem == 0) { errorMessage = "Timeout waiting for byteCount."; return {}; }
+    if (rem == 0) { setError("Timeout waiting for byteCount."); return {}; }
 
     auto third = _serialReceive(1, rem);
     if (third.empty()) return {};
@@ -482,12 +601,12 @@ std::vector<uint8_t> Modbus::_receiveRtuResponse(uint8_t expected_slave,
     // Remaining = byteCount data + CRC2
 
     rem = remaining_ms();
-    if (rem == 0) { errorMessage = "Timeout waiting for data/CRC."; return {}; }
+    if (rem == 0) { setError("Timeout waiting for data/CRC."); return {}; }
 
     auto rest = _serialReceive(static_cast<size_t>(byteCount) + 2, rem);
     if (rest.empty()) return {};
 
-    std::vector<uint8_t> resp;
+    ModbusBuffer<uint8_t> resp;
     resp.reserve(3 + byteCount + 2);
     resp.insert(resp.end(), first2.begin(), first2.end());
     resp.push_back(byteCount);
@@ -501,79 +620,76 @@ std::vector<uint8_t> Modbus::_receiveRtuResponse(uint8_t expected_slave,
 // Modbus operations
 // ------------------------
 
-std::vector<uint8_t> Modbus::readCoils(uint8_t slaveID, uint16_t starting_address, uint16_t quantity)
+ModbusBuffer<uint8_t> Modbus::readCoils(uint8_t slaveID, uint16_t starting_address, uint16_t quantity)
 {
-    if (!isPortOpen()) { errorMessage = "Port is closed."; return {}; }
-    if (quantity == 0 || quantity > 2000) { errorMessage = "Invalid quantity (1..2000)."; return {}; }
+    if (!isPortOpen()) { setError("Port is closed."); return {}; }
+    if (quantity == 0 || quantity > 2000) { setError("Invalid quantity (1..2000)."); return {}; }
 
     const uint16_t addr = _normalizeCoilAddress(starting_address);
 
-    std::vector<uint8_t> req{
-        slaveID, 0x01,
-        static_cast<uint8_t>(addr >> 8), static_cast<uint8_t>(addr & 0xFF),
-        static_cast<uint8_t>(quantity >> 8), static_cast<uint8_t>(quantity & 0xFF)
-    };
+    ModbusBuffer<uint8_t> req;
+    req.push_back(slaveID); req.push_back(0x01);
+    req.push_back(static_cast<uint8_t>(addr >> 8)); req.push_back(static_cast<uint8_t>(addr & 0xFF));
+    req.push_back(static_cast<uint8_t>(quantity >> 8)); req.push_back(static_cast<uint8_t>(quantity & 0xFF));
     _appendCrc(req);
 
     if (!_serialSend(req)) return {};
 
     auto resp = _receiveRtuResponse(slaveID, 0x01, 0, parameters.RESPONSE_TIMEOUT_MS);
-    if (resp.size() < 5) { errorMessage = "Response too short."; return {}; }
+    if (resp.size() < 5) { setError("Response too short."); return {}; }
 
     const uint8_t byteCount = resp[2];
     const size_t expectedByteCount = (quantity + 7u) / 8u;
     if (byteCount != expectedByteCount)
     {
-        errorMessage = "Byte-count mismatch in response.";
+        setError("Byte-count mismatch in response.");
         return {};
     }
 
     // return ONLY data bytes
-    return std::vector<uint8_t>(resp.begin() + 3, resp.end() - 2);
+    return ModbusBuffer<uint8_t>(resp.begin() + 3, resp.end() - 2);
 }
 
-std::vector<uint8_t> Modbus::readDiscreteInputs(uint8_t slaveID, uint16_t starting_address, uint16_t quantity)
+ModbusBuffer<uint8_t> Modbus::readDiscreteInputs(uint8_t slaveID, uint16_t starting_address, uint16_t quantity)
 {
-    if (!isPortOpen()) { errorMessage = "Port is closed."; return {}; }
-    if (quantity == 0 || quantity > 2000) { errorMessage = "Invalid quantity (1..2000)."; return {}; }
+    if (!isPortOpen()) { setError("Port is closed."); return {}; }
+    if (quantity == 0 || quantity > 2000) { setError("Invalid quantity (1..2000)."); return {}; }
 
     const uint16_t addr = _normalizeDiscreteInputAddress(starting_address);
 
-    std::vector<uint8_t> req{
-        slaveID, 0x02,
-        static_cast<uint8_t>(addr >> 8), static_cast<uint8_t>(addr & 0xFF),
-        static_cast<uint8_t>(quantity >> 8), static_cast<uint8_t>(quantity & 0xFF)
-    };
+    ModbusBuffer<uint8_t> req;
+    req.push_back(slaveID); req.push_back(0x02);
+    req.push_back(static_cast<uint8_t>(addr >> 8)); req.push_back(static_cast<uint8_t>(addr & 0xFF));
+    req.push_back(static_cast<uint8_t>(quantity >> 8)); req.push_back(static_cast<uint8_t>(quantity & 0xFF));
     _appendCrc(req);
 
     if (!_serialSend(req)) return {};
 
     auto resp = _receiveRtuResponse(slaveID, 0x02, 0, parameters.RESPONSE_TIMEOUT_MS);
-    if (resp.size() < 5) { errorMessage = "Response too short."; return {}; }
+    if (resp.size() < 5) { setError("Response too short."); return {}; }
 
     const uint8_t byteCount = resp[2];
     const size_t expectedByteCount = (quantity + 7u) / 8u;
     if (byteCount != expectedByteCount)
     {
-        errorMessage = "Byte-count mismatch in response.";
+        setError("Byte-count mismatch in response.");
         return {};
     }
 
-    return std::vector<uint8_t>(resp.begin() + 3, resp.end() - 2);
+    return ModbusBuffer<uint8_t>(resp.begin() + 3, resp.end() - 2);
 }
 
 bool Modbus::writeSingleCoil(uint8_t slaveID, uint16_t address, bool on)
 {
-    if (!isPortOpen()) { errorMessage = "Port is closed."; return false; }
+    if (!isPortOpen()) { setError("Port is closed."); return false; }
 
     const uint16_t addr = _normalizeCoilAddress(address);
     const uint16_t val  = on ? 0xFF00 : 0x0000;
 
-    std::vector<uint8_t> req{
-        slaveID, 0x05,
-        static_cast<uint8_t>(addr >> 8), static_cast<uint8_t>(addr & 0xFF),
-        static_cast<uint8_t>(val >> 8),  static_cast<uint8_t>(val & 0xFF)
-    };
+    ModbusBuffer<uint8_t> req;
+    req.push_back(slaveID); req.push_back(0x05);
+    req.push_back(static_cast<uint8_t>(addr >> 8)); req.push_back(static_cast<uint8_t>(addr & 0xFF));
+    req.push_back(static_cast<uint8_t>(val >> 8)); req.push_back(static_cast<uint8_t>(val & 0xFF));
     _appendCrc(req);
 
     if (!_serialSend(req)) return false;
@@ -587,28 +703,26 @@ bool Modbus::writeSingleCoil(uint8_t slaveID, uint16_t address, bool on)
     const uint16_t rval  = (static_cast<uint16_t>(resp[4]) << 8) | resp[5];
     if (raddr != addr || rval != val)
     {
-        errorMessage = "0x05 echo mismatch.";
+        setError("0x05 echo mismatch.");
         return false;
     }
 
     return !resp.empty();
 }
 
-std::vector<uint8_t> Modbus::readHoldingRegisters(uint8_t slaveID, uint16_t starting_address, uint16_t num_registers)
+ModbusBuffer<uint8_t> Modbus::readHoldingRegisters(uint8_t slaveID, uint16_t starting_address, uint16_t num_registers)
 {
-    if (!isPortOpen()) { errorMessage = "Read failed. Port is closed."; return {}; }
-    if (num_registers == 0 || num_registers > 125) { errorMessage = "Invalid quantity (1..125)."; return {}; }
+    if (!isPortOpen()) { setError("Read failed. Port is closed."); return {}; }
+    if (num_registers == 0 || num_registers > 125) { setError("Invalid quantity (1..125)."); return {}; }
 
     // 1. Build the Modbus Request (6 bytes)
     // Modbus 4XXXX registers use 0-based addressing (40001 -> 0x0000)
     const uint16_t addr = _normalizeHoldingRegisterAddress(starting_address);
 
-    std::vector<uint8_t> req
-    {
-        slaveID, 0x03,
-        static_cast<uint8_t>(addr >> 8), static_cast<uint8_t>(addr & 0xFF),
-        static_cast<uint8_t>(num_registers >> 8), static_cast<uint8_t>(num_registers & 0xFF)
-    };
+    ModbusBuffer<uint8_t> req;
+    req.push_back(slaveID); req.push_back(0x03);
+    req.push_back(static_cast<uint8_t>(addr >> 8)); req.push_back(static_cast<uint8_t>(addr & 0xFF));
+    req.push_back(static_cast<uint8_t>(num_registers >> 8)); req.push_back(static_cast<uint8_t>(num_registers & 0xFF));
 
     // 2. Calculate and Append CRC-16
     _appendCrc(req);
@@ -619,29 +733,29 @@ std::vector<uint8_t> Modbus::readHoldingRegisters(uint8_t slaveID, uint16_t star
     auto resp = _receiveRtuResponse(slaveID, 0x03, 0, parameters.RESPONSE_TIMEOUT_MS);
     if (resp.empty()) return {};
 
-    if (resp.size() < 5) { errorMessage = "Response too short."; return {}; }
+    if (resp.size() < 5) { setError("Response too short."); return {}; }
 
     const uint8_t byteCount = resp[2];
     if (byteCount != static_cast<uint8_t>(num_registers * 2))
     {
-        errorMessage = "Byte-count mismatch in response.";
+        setError("Byte-count mismatch in response.");
         return {};
     }
 
     // return ONLY data bytes
-    return std::vector<uint8_t>(resp.begin() + 3, resp.end() - 2);
+    return ModbusBuffer<uint8_t>(resp.begin() + 3, resp.end() - 2);
 }
 
 bool Modbus::readHoldingRegisters(uint8_t slaveID, uint16_t starting_address, uint16_t num_registers, uint16_t* buffer)
 {
-    if (!buffer) { errorMessage = "Output buffer is null."; return false; }
-    if (!isPortOpen()) { errorMessage = "Read failed. Port is closed."; return false; }
-    if (num_registers == 0 || num_registers > 125) { errorMessage = "Invalid quantity (1..125)."; return false; }
+    if (!buffer) { setError("Output buffer is null."); return false; }
+    if (!isPortOpen()) { setError("Read failed. Port is closed."); return false; }
+    if (num_registers == 0 || num_registers > 125) { setError("Invalid quantity (1..125)."); return false; }
 
     auto data = readHoldingRegisters(slaveID, starting_address, num_registers);
     if (data.size() != static_cast<size_t>(num_registers) * 2)
     {
-        errorMessage = "Holding register data length mismatch.";
+        setError("Holding register data length mismatch.");
         return false;
     }
 
@@ -653,18 +767,17 @@ bool Modbus::readHoldingRegisters(uint8_t slaveID, uint16_t starting_address, ui
     return true;
 }
 
-std::vector<uint8_t> Modbus::readInputRegisters(uint8_t slaveID, uint16_t starting_address, uint16_t quantity)
+ModbusBuffer<uint8_t> Modbus::readInputRegisters(uint8_t slaveID, uint16_t starting_address, uint16_t quantity)
 {
-    if (!isPortOpen()) { errorMessage = "Port is closed."; return {}; }
-    if (quantity == 0 || quantity > 125) { errorMessage = "Invalid quantity (1..125)."; return {}; }
+    if (!isPortOpen()) { setError("Port is closed."); return {}; }
+    if (quantity == 0 || quantity > 125) { setError("Invalid quantity (1..125)."); return {}; }
 
     const uint16_t addr = _normalizeInputRegisterAddress(starting_address);
 
-    std::vector<uint8_t> req{
-        slaveID, 0x04,
-        static_cast<uint8_t>(addr >> 8), static_cast<uint8_t>(addr & 0xFF),
-        static_cast<uint8_t>(quantity >> 8), static_cast<uint8_t>(quantity & 0xFF)
-    };
+    ModbusBuffer<uint8_t> req;
+    req.push_back(slaveID); req.push_back(0x04);
+    req.push_back(static_cast<uint8_t>(addr >> 8)); req.push_back(static_cast<uint8_t>(addr & 0xFF));
+    req.push_back(static_cast<uint8_t>(quantity >> 8)); req.push_back(static_cast<uint8_t>(quantity & 0xFF));
     _appendCrc(req);
 
     if (!_serialSend(req)) return {};
@@ -672,27 +785,27 @@ std::vector<uint8_t> Modbus::readInputRegisters(uint8_t slaveID, uint16_t starti
     auto resp = _receiveRtuResponse(slaveID, 0x04, 0, parameters.RESPONSE_TIMEOUT_MS);
     if (resp.empty()) return {};
     // resp = [id][fc][byteCount][data...][crc][crc]
-    if (resp.size() < 5) { errorMessage = "Response too short."; return {}; }
+    if (resp.size() < 5) { setError("Response too short."); return {}; }
 
     const uint8_t byteCount = resp[2];
     if (byteCount != quantity * 2)
     {
-        errorMessage = "Byte-count mismatch in response.";
+        setError("Byte-count mismatch in response.");
         return {};
     }
 
-    return std::vector<uint8_t>(resp.begin() + 3, resp.end() - 2);
+    return ModbusBuffer<uint8_t>(resp.begin() + 3, resp.end() - 2);
 }
 
 bool Modbus::readInputRegisters(uint8_t slaveID, uint16_t starting_address, uint16_t quantity, uint16_t* out)
 {
-    if (!out) { errorMessage = "Output buffer is null."; return false; }
-    if (quantity == 0 || quantity > 125) { errorMessage = "Invalid quantity (1..125)."; return false; }
+    if (!out) { setError("Output buffer is null."); return false; }
+    if (quantity == 0 || quantity > 125) { setError("Invalid quantity (1..125)."); return false; }
 
     auto data = readInputRegisters(slaveID, starting_address, quantity);
     if (data.size() != static_cast<size_t>(quantity) * 2)
     {
-        errorMessage = "Input register data length mismatch.";
+        setError("Input register data length mismatch.");
         return false;
     }
 
@@ -708,7 +821,7 @@ bool Modbus::writeSingleRegister(uint8_t slaveID, uint16_t starting_address, uin
 {
     if (!isPortOpen()) 
     {
-        errorMessage = "Modbus port is closed.";
+        setError("Modbus port is closed.");
         return false;
     }
 
@@ -716,15 +829,12 @@ bool Modbus::writeSingleRegister(uint8_t slaveID, uint16_t starting_address, uin
     uint16_t address_0based = _normalizeHoldingRegisterAddress(starting_address);
 
     // 2. Build the Modbus Request (6 bytes + 2 CRC)
-    std::vector<uint8_t> request_data = 
-    {
-        slaveID,
-        0x06,                           // Function Code: 06 (Write Single Register)
-        (uint8_t)(address_0based >> 8),
-        (uint8_t)(address_0based & 0xFF),
-        (uint8_t)(value >> 8),
-        (uint8_t)(value & 0xFF)
-    };
+    ModbusBuffer<uint8_t> request_data;
+    request_data.push_back(slaveID); request_data.push_back(0x06);
+    request_data.push_back(static_cast<uint8_t>(address_0based >> 8));
+    request_data.push_back(static_cast<uint8_t>(address_0based & 0xFF));
+    request_data.push_back(static_cast<uint8_t>(value >> 8));
+    request_data.push_back(static_cast<uint8_t>(value & 0xFF));
 
     // 3. Append CRC-16
     _appendCrc(request_data);
@@ -741,25 +851,25 @@ bool Modbus::writeSingleRegister(uint8_t slaveID, uint16_t starting_address, uin
     // ✅ Use RTU receiver so exception frames (5 bytes) don't cause a timeout hang.
 
     // size_t expected_length = 8; 
-    // std::vector<uint8_t> response = _serialReceive(expected_length, parameters.RESPONSE_TIMEOUT_MS);
+    // ModbusBuffer<uint8_t> response = _serialReceive(expected_length, parameters.RESPONSE_TIMEOUT_MS);
 
     // if (response.size() != expected_length)
     // {
-    //     errorMessage = "ERROR: Write response timeout or incomplete.";
+    //     setError("ERROR: Write response timeout or incomplete.");
     //     return false;
     // }
 
     auto response = _receiveRtuResponse(slaveID, 0x06, 8, parameters.RESPONSE_TIMEOUT_MS);
     if (response.empty()) 
     {
-        errorMessage = "Modbus response is empty.";
+        setError("Modbus response is empty.");
         return false;   // errorMessage already set 
     }
 
 
     // if (!_verifyCrc(response))
     // {
-    //     errorMessage = "CRC mismatch in response.";
+    //     setError("CRC mismatch in response.");
     //     return false;
     // }
 
@@ -768,13 +878,13 @@ bool Modbus::writeSingleRegister(uint8_t slaveID, uint16_t starting_address, uin
     // {
     //     std::ostringstream oss;
     //     oss << "MODBUS ERROR: Exception code 0x" << std::hex << (int)response[2] << std::dec;
-    //     errorMessage = oss.str();
+    //     setError(oss.str().c_str());
     //     return false;
     // }
 
     // if (response[0] != slaveID || response[1] != 0x06)
     // {
-    //     errorMessage = "Write single register response header mismatch.";
+    //     setError("Write single register response header mismatch.");
     //     return false;
     // }
 
@@ -783,7 +893,7 @@ bool Modbus::writeSingleRegister(uint8_t slaveID, uint16_t starting_address, uin
     const uint16_t rval  = (static_cast<uint16_t>(response[4]) << 8) | response[5];
     if (raddr != address_0based || rval != value)
     {
-        errorMessage = "0x06 echo mismatch.";
+        setError("0x06 echo mismatch.");
         return false;
     }
 
@@ -793,21 +903,20 @@ bool Modbus::writeSingleRegister(uint8_t slaveID, uint16_t starting_address, uin
     return true;
 }
 
-bool Modbus::writeMultipleCoils(uint8_t slaveID, uint16_t starting_address, const std::vector<bool>& values)
+bool Modbus::writeMultipleCoils(uint8_t slaveID, uint16_t starting_address, const ModbusBuffer<bool>& values)
 {
-    if (!isPortOpen()) { errorMessage = "Port is closed."; return false; }
-    if (values.empty() || values.size() > 1968) { errorMessage = "Invalid quantity (1..1968)."; return false; }
+    if (!isPortOpen()) { setError("Port is closed."); return false; }
+    if (values.empty() || values.size() > 1968) { setError("Invalid quantity (1..1968)."); return false; }
 
     const uint16_t addr = _normalizeCoilAddress(starting_address);
     const uint16_t qty  = static_cast<uint16_t>(values.size());
     const uint16_t byteCount = static_cast<uint16_t>((qty + 7) / 8);
 
-    std::vector<uint8_t> req{
-        slaveID, 0x0F,
-        static_cast<uint8_t>(addr >> 8), static_cast<uint8_t>(addr & 0xFF),
-        static_cast<uint8_t>(qty >> 8),  static_cast<uint8_t>(qty & 0xFF),
-        static_cast<uint8_t>(byteCount)
-    };
+    ModbusBuffer<uint8_t> req;
+    req.push_back(slaveID); req.push_back(0x0F);
+    req.push_back(static_cast<uint8_t>(addr >> 8)); req.push_back(static_cast<uint8_t>(addr & 0xFF));
+    req.push_back(static_cast<uint8_t>(qty >> 8)); req.push_back(static_cast<uint8_t>(qty & 0xFF));
+    req.push_back(static_cast<uint8_t>(byteCount));
 
     // Pack bits (LSB first per Modbus)
     req.resize(req.size() + byteCount, 0);
@@ -825,25 +934,22 @@ bool Modbus::writeMultipleCoils(uint8_t slaveID, uint16_t starting_address, cons
     return !resp.empty();
 }
 
-bool Modbus::writeMultipleRegisters(uint8_t slaveID, uint16_t starting_address, const std::vector<uint16_t>& values) 
+bool Modbus::writeMultipleRegisters(uint8_t slaveID, uint16_t starting_address, const ModbusBuffer<uint16_t>& values) 
 {
-    if (!isPortOpen()) { errorMessage = "Port is closed."; return false; }
-    if (values.empty() || values.size() > 123) { errorMessage = "Invalid quantity (1..123)."; return false; }
+    if (!isPortOpen()) { setError("Port is closed."); return false; }
+    if (values.empty() || values.size() > 123) { setError("Invalid quantity (1..123)."); return false; }
 
     uint16_t num_registers = values.size();
     uint16_t address_0based = _normalizeHoldingRegisterAddress(starting_address);
 
     // 1. Build the Modbus Request Header
-    std::vector<uint8_t> request_data = 
-    {
-        slaveID,
-        0x10,                           // Function Code: 0x10 (Write Multiple Registers)
-        (uint8_t)(address_0based >> 8),
-        (uint8_t)(address_0based & 0xFF),
-        (uint8_t)(num_registers >> 8),
-        (uint8_t)(num_registers & 0xFF),
-        (uint8_t)(num_registers * 2)    // Byte Count (2 bytes per register)
-    };
+    ModbusBuffer<uint8_t> request_data;
+    request_data.push_back(slaveID); request_data.push_back(0x10);
+    request_data.push_back(static_cast<uint8_t>(address_0based >> 8));
+    request_data.push_back(static_cast<uint8_t>(address_0based & 0xFF));
+    request_data.push_back(static_cast<uint8_t>(num_registers >> 8));
+    request_data.push_back(static_cast<uint8_t>(num_registers & 0xFF));
+    request_data.push_back(static_cast<uint8_t>(num_registers * 2));
 
     // 2. Append the Register Data (Big Endian)
     for (uint16_t val : values) 
@@ -871,7 +977,7 @@ bool Modbus::writeMultipleRegisters(uint8_t slaveID, uint16_t starting_address, 
     const uint16_t rqty  = (static_cast<uint16_t>(response[4]) << 8) | response[5];
     if (raddr != address_0based || rqty != num_registers)
     {
-        errorMessage = "0x10 response echo mismatch.";
+        setError("0x10 response echo mismatch.");
         return false;
     }
 
@@ -886,16 +992,13 @@ bool Modbus::writeMultipleRegisters(uint8_t slaveID, uint16_t starting_address, 
     uint16_t address_0based = _normalizeHoldingRegisterAddress(starting_address);
 
     // 1. Build the Modbus Request Header
-    std::vector<uint8_t> request_data = 
-    {
-        slaveID,
-        0x10,                           // Function Code: 0x10 (Write Multiple Registers)
-        (uint8_t)(address_0based >> 8),
-        (uint8_t)(address_0based & 0xFF),
-        (uint8_t)(num_registers >> 8),
-        (uint8_t)(num_registers & 0xFF),
-        (uint8_t)(num_registers * 2)    // Byte Count (2 bytes per register)
-    };
+    ModbusBuffer<uint8_t> request_data;
+    request_data.push_back(slaveID); request_data.push_back(0x10);
+    request_data.push_back(static_cast<uint8_t>(address_0based >> 8));
+    request_data.push_back(static_cast<uint8_t>(address_0based & 0xFF));
+    request_data.push_back(static_cast<uint8_t>(num_registers >> 8));
+    request_data.push_back(static_cast<uint8_t>(num_registers & 0xFF));
+    request_data.push_back(static_cast<uint8_t>(num_registers * 2));
 
     // 2. Append the Register Data (Big Endian)
     for (uint16_t i = 0; i < num_registers; i++) 
@@ -922,7 +1025,7 @@ bool Modbus::writeMultipleRegisters(uint8_t slaveID, uint16_t starting_address, 
     const uint16_t rqty  = (static_cast<uint16_t>(response[4]) << 8) | response[5];
     if (raddr != address_0based || rqty != num_registers)
     {
-        errorMessage = "0x10 response echo mismatch.";
+        setError("0x10 response echo mismatch.");
         return false;
     }
 
@@ -934,20 +1037,24 @@ bool Modbus::writeMultipleRegisters(uint8_t slaveID, uint16_t starting_address, 
 // Debug
 // ------------------------
 
-void Modbus::printHex(const std::vector<uint8_t>& data) 
+void Modbus::printHex(const ModbusBuffer<uint8_t>& data) 
 {
+#if defined(_PLATFORM_PC_)
     for (const auto& byte : data) 
     {
         std::cout << "{" << std::hex << std::setw(2) << std::setfill('0') << (int)byte << "}";
     }
     std::cout << std::dec << std::endl;
+#else
+    (void)data; // MCU applications can log bytes through their own diagnostic interface.
+#endif
 }
 
 // ------------------------
 // CRC16 (Modbus RTU)
 // ------------------------
 
-uint16_t Modbus::_crc16_modbus(const std::vector<uint8_t>& data) 
+uint16_t Modbus::_crc16_modbus(const ModbusBuffer<uint8_t>& data) 
 {
     uint16_t crc = 0xFFFF;
     for (uint8_t byte : data) 
@@ -984,7 +1091,7 @@ uint16_t Modbus::_crc16_modbus(const uint8_t* data, size_t len)
     return crc;
 }
 
-bool Modbus::_verifyCrc(const std::vector<uint8_t>& frame)
+bool Modbus::_verifyCrc(const ModbusBuffer<uint8_t>& frame)
 {
     if (frame.size() < 4) return false;
     const size_t n = frame.size();
@@ -993,7 +1100,7 @@ bool Modbus::_verifyCrc(const std::vector<uint8_t>& frame)
     return got == calc;
 }
 
-void Modbus::_appendCrc(std::vector<uint8_t>& frame)
+void Modbus::_appendCrc(ModbusBuffer<uint8_t>& frame)
 {
     const uint16_t crc = Modbus::_crc16_modbus(frame.data(), frame.size());
     frame.push_back(static_cast<uint8_t>(crc & 0xFF));

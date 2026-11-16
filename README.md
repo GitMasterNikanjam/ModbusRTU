@@ -1,6 +1,6 @@
-# ModbusLinuxRS485 (Modbus RTU Master for Linux)
+# ModbusRS485 (Modbus RTU Master for Linux and STM32)
 
-A lightweight **Modbus RTU (RS-485) master** implementation for Linux serial ports (termios-based).  
+A lightweight **Modbus RTU (RS-485) master** for Linux serial ports and STM32Cube HAL UARTs.
 It supports common Modbus function codes for reading/writing coils and registers, performs CRC16 checks internally, and returns clear error messages via `Modbus::errorMessage`.
 
 ---
@@ -24,13 +24,27 @@ It supports common Modbus function codes for reading/writing coils and registers
 
 ---
 
-## Supported Platforms
+## Platform selection
 
-- Linux (tested with termios serial API)
-- RS-485 via:
-  - USB-RS485 adapters
-  - UART + RS-485 transceiver
-  - Native RS-485 ports
+The header defines `_PLATFORM_PC_` automatically using the project's compiler check. Linux uses POSIX/termios I/O. STM32 builds use the project's `Serial` class; no platform selection define is required from the application.
+
+### STM32 RS-485 wiring and setup
+
+Connect the MCU UART TX/RX to the RS-485 transceiver TXD/RXD. Connect one MCU GPIO to the transceiver direction input (DE and `/RE` tied together if the transceiver requires both). The library drives that GPIO to `transmitLevel` during TX and to the opposite level for RX.
+
+The UART must already be initialized by the application. Configure the project `Serial` object for the selected UART and call:
+
+```cpp
+Serial rs485Serial;
+Modbus modbus;
+
+// Set the application-owned HAL UART; begin() configures Serial in blocking mode.
+rs485Serial.setUart(&huart2);
+modbus.parameters.BAUDRATE = 115200; // Serial_STM32 supports 9600, 57600, 115200
+modbus.begin(&rs485Serial, RS485_DIR_GPIO_Port, RS485_DIR_Pin, GPIO_PIN_SET);
+```
+
+Set parity, word length, and stop bits in the Cube/HAL UART configuration to match the slave. Use blocking TX/RX modes; `Modbus::begin()` selects those modes on the supplied `Serial` object. On STM32, `openPort()` is retained for API compatibility and returns the state established by `begin()`.
 
 ---
 

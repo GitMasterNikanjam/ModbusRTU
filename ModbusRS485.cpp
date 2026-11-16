@@ -541,16 +541,26 @@ ModbusBuffer<uint8_t> Modbus::_receiveRtuResponse(uint8_t expected_slave,
                                                 size_t expected_fixed_len,
                                                 uint32_t timeout_ms)
 {
-    const uint64_t deadline_ms = now_ms() + (uint64_t)timeout_ms;
-
-    auto remaining_ms = [&]() -> uint32_t
-    {
-        uint64_t now = now_ms();
-        if (now >= deadline_ms) return 0;
-        uint64_t rem = deadline_ms - now;
-        if (rem > 0xFFFFFFFFULL) rem = 0xFFFFFFFFULL;
-        return (uint32_t)rem;
-    };
+    #if defined(_PLATFORM_PC_)
+        const uint64_t deadline_ms = now_ms() + static_cast<uint64_t>(timeout_ms);
+        auto remaining_ms = [&]() -> uint32_t
+        {
+            uint64_t now = now_ms();
+            if (now >= deadline_ms) return 0;
+            uint64_t rem = deadline_ms - now;
+            if (rem > 0xFFFFFFFFULL) rem = 0xFFFFFFFFULL;
+            return (uint32_t)rem;
+        };
+    #else
+        // HAL_GetTick() is a 32-bit millisecond counter and wraps about every 49.7 days.
+        // Unsigned subtraction yields the correct elapsed time across that single wrap.
+        const uint32_t start_tick = static_cast<uint32_t>(now_ms());
+        auto remaining_ms = [&]() -> uint32_t
+        {
+            const uint32_t elapsed = static_cast<uint32_t>(now_ms()) - start_tick;
+            return elapsed >= timeout_ms ? 0u : timeout_ms - elapsed;
+        };
+    #endif
 
     // For read functions, expected_fixed_len = 0; we will read header to compute full len.
     // For write echoes/acks, expected_fixed_len is known (usually 8).

@@ -1,11 +1,12 @@
 #pragma once
 
 /**
- * @file ModbusLinuxRS485.h
- * @brief Modbus RTU (RS-485) master implementation for Linux serial ports.
+ * @file ModbusRS485.h
+ * @brief Cross-platform Modbus RTU master for Linux and STM32 RS-485 links.
  *
- * This library provides a lightweight Modbus RTU master suitable for communicating
- * with Modbus slave devices over an RS-485 serial interface on Linux.
+ * Modbus framing, function codes, address handling and CRC are shared by both targets.
+ * Linux uses POSIX serial I/O. STM32 uses the project `Serial` wrapper and a GPIO to
+ * control the external RS-485 transceiver direction.
  *
  * @par Addressing convention
  * All public API addresses (coils, discrete inputs, input registers, holding registers)
@@ -22,15 +23,24 @@
  * This is **Modbus RTU** (binary, CRC-based) over serial. It is not Modbus TCP.
  *
  * @par Error reporting
- * On failure, functions typically return `false` or an empty vector and set
- * @ref Modbus::errorMessage with a human-readable error explanation.
+ * On failure, operations return `false` or an empty buffer and copy a short,
+ * null-terminated explanation into @ref Modbus::errorMessage.
+ *
+ * @par MCU memory model
+ * MCU builds do not include `<vector>`. @ref ModbusBuffer is a fixed-capacity buffer
+ * with no heap allocation. Linux builds alias it to `std::vector` for compatibility.
  */
 
 // ######################################################################################
 // Includes
 // ######################################################################################
 
-/* Match the platform convention used by Serial_STM32. */
+/**
+ * @def _PLATFORM_PC_
+ * @brief Automatically marks hosted PC builds (Linux/Windows) using the project's compiler test.
+ *
+ * When this macro is absent, the header selects the STM32 backend and includes `Serial.h`.
+ */
 #if defined(__linux__) || defined(_WIN32) && !defined(__CC_ARM) && !defined(__ARMCOMPILER_VERSION)
     #define _PLATFORM_PC_
 #endif
@@ -42,41 +52,72 @@
 #if defined(_PLATFORM_PC_)
     #include <vector>
     #include <string>
+    /** @brief Platform buffer type; an alias for std::vector on PC builds. */
     template <typename T> using ModbusBuffer = std::vector<T>;
 #else
+    /** @brief Compile-time element capacity for each fixed MCU buffer type. */
     template <typename T> struct ModbusBufferCapacity { enum { value = 256 }; };
     template <> struct ModbusBufferCapacity<uint8_t> { enum { value = 256 }; };
     template <> struct ModbusBufferCapacity<uint16_t> { enum { value = 123 }; };
     template <> struct ModbusBufferCapacity<bool> { enum { value = 1968 }; };
 
-    /** Fixed-capacity, allocation-free vector-like buffer used by the MCU backend. */
+    /**
+     * @brief Fixed-capacity, allocation-free vector-like buffer used by the MCU backend.
+     * @tparam T Element type. uint8_t buffers hold 256 bytes, uint16_t 123 words,
+     *           and bool 1968 values; other types hold 256 elements.
+     * @note Insertions beyond capacity are ignored. Callers must validate input sizes.
+     */
     template <typename T> class ModbusBuffer
     {
     public:
+        /** @brief Mutable iterator over the populated elements. */
         typedef T* iterator;
+        /** @brief Read-only iterator over the populated elements. */
         typedef const T* const_iterator;
+        /** @brief Construct an empty fixed-capacity buffer. */
         ModbusBuffer() : size_(0) {}
+        /** @brief Construct a buffer by copying the half-open input range. */
         template <typename It> ModbusBuffer(It first, It last) : size_(0) { insert(end(), first, last); }
+        /** @brief Number of populated elements. */
         size_t size() const { return size_; }
+        /** @brief Return true when no elements are stored. */
         bool empty() const { return size_ == 0; }
+        /** @brief Pointer to the first stored element. */
         T* data() { return data_; }
+        /** @brief Const pointer to the first stored element. */
         const T* data() const { return data_; }
+        /** @brief Iterator to the first element. */
         iterator begin() { return data_; }
+        /** @brief Const iterator to the first element. */
         const_iterator begin() const { return data_; }
+        /** @brief Iterator one past the last element. */
         iterator end() { return data_ + size_; }
+        /** @brief Const iterator one past the last element. */
         const_iterator end() const { return data_ + size_; }
+        /** @brief Access an element by index without bounds checking. */
         T& operator[](size_t i) { return data_[i]; }
+        /** @brief Read an element by index without bounds checking. */
         const T& operator[](size_t i) const { return data_[i]; }
+        /** @brief Compatibility no-op; capacity is fixed at compile time. */
         void reserve(size_t) {}
+        /** @brief Remove all elements without releasing storage. */
         void clear() { size_ = 0; }
+        /** @brief Append an element unless the buffer is already full. */
         void push_back(const T& v) { if (size_ < capacity()) data_[size_++] = v; }
+        /** @brief Resize, default-initializing newly added elements. */
         void resize(size_t n) { resize(n, T()); }
+        /** @brief Resize, filling new elements with @p value; clamps to capacity. */
         void resize(size_t n, const T& value) { if (n > capacity()) n = capacity(); while (size_ < n) data_[size_++] = value; size_ = n; }
+        /** @brief Insert one value at @p pos, shifting later values right. */
         iterator insert(iterator pos, const T& value) { size_t i = static_cast<size_t>(pos - begin()); if (size_ >= capacity()) return end(); for (size_t j=size_; j>i; --j) data_[j]=data_[j-1]; data_[i]=value; ++size_; return begin()+i; }
+        /** @brief Insert a half-open input range at @p pos, up to available capacity. */
         template <typename It> iterator insert(iterator pos, It first, It last) { size_t i=static_cast<size_t>(pos-begin()); while(first!=last && size_<capacity()) { insert(begin()+i, *first++); ++i; } return begin()+i; }
+        /** @brief Maximum number of elements this buffer can store. */
         static size_t capacity() { return ModbusBufferCapacity<T>::value; }
     private:
+        /** @brief Inline storage; never allocated from the heap. */
         T data_[ModbusBufferCapacity<T>::value];
+        /** @brief Number of initialized elements in @ref data_. */
         size_t size_;
     };
 #endif
@@ -93,33 +134,32 @@
  * @class Modbus
  * @brief Modbus RTU master utility for RS-485 serial devices.
  *
- * This class provides a minimal abstraction for Modbus RTU master operations
- * over a Linux serial port (e.g. `/dev/ttyUSB0`, `/dev/ttyS0`).
+ * This class provides Modbus RTU master operations over either a Linux serial device
+ * or an STM32 HAL UART connected to an external RS-485 transceiver.
  *
  * Supported operations include reading and writing coils and registers using
  * common Modbus function codes.
  *
  * @note
- * - Modbus RTU requires correct serial framing (baud, parity, stop bits).
+ * - Modbus RTU requires matching baud, parity, word length and stop bits at both ends.
  * - CRC handling is performed internally by the implementation.
  * - Public API addresses are 0-based Modbus protocol addresses (see file header).
+ * - On MCU, configure the UART through `Serial`, then call @ref begin with the transceiver
+ *   direction GPIO. The GPIO is set to `transmitLevel` while transmitting and inverted for receive.
+ * - The library object is synchronous/blocking and is not safe for simultaneous calls from
+ *   multiple tasks without an application mutex.
  */
 class Modbus 
 {
     public:
 
-        /**
-         * @brief Human-readable message describing the last error.
-         *
-         * This member is updated whenever an operation fails. It may contain:
-         * - system errors (e.g. failing to open the serial device, I/O errors),
-         * - protocol errors (CRC mismatch, unexpected function code, Modbus exception response),
-         * - validation errors (invalid quantity, invalid address range, etc.).
-         *
-         * @warning Not thread-safe: if multiple threads call methods concurrently,
-         *          errorMessage may be overwritten.
-         */
+        /** @brief Storage capacity of @ref errorMessage, including its null terminator. */
         static constexpr uint16_t ERROR_MESSAGE_CAPACITY = 96;
+        /**
+         * @brief Null-terminated description of the most recent error; empty on success.
+         * @note Fixed storage on both platforms. Content is overwritten by subsequent operations.
+         * @warning Not thread-safe; serialize calls if sharing one Modbus instance across tasks.
+         */
         char errorMessage[ERROR_MESSAGE_CAPACITY];
 
         /**
@@ -139,17 +179,17 @@ class Modbus
          * @struct ParametersStructure
          * @brief Serial communication configuration parameters.
          *
-         * Configure these parameters before calling @ref openPort().
+         * Configure these parameters before @ref openPort() on PC or @ref begin() on MCU.
          *
-         * @note The implementation must translate BAUDRATE / parity / stop bits / data bits
-         *       into Linux termios configuration.
+         * @note Linux applies serial framing through termios. STM32 applies BAUDRATE through
+         *       `Serial::begin()`; parity, word length and stop bits must already be configured
+         *       in the supplied HAL UART handle.
          */
         struct ParametersStructure
         {
             /**
-             * @brief Serial port device path (e.g., "/dev/ttyUSB0", "/dev/ttyS0").
-             *
-             * @note Example: "/dev/ttyUSB0"
+             * @brief Linux serial device path, for example `/dev/ttyUSB0`.
+             * @note Not present in MCU builds.
              */
             #if defined(_PLATFORM_PC_)
                 std::string PORT;
@@ -158,19 +198,13 @@ class Modbus
             /**
              * @brief Baud rate for serial communication.
              *
-             * Common Modbus RTU baud rates include: 9600, 19200, 38400, 57600, 115200.
-             * The implementation should reject unsupported baud rates.
+             * @brief Serial baud rate. STM32 `Serial` currently accepts 9600, 57600 and 115200.
              */
             uint32_t BAUDRATE;
 
             /**
-             * @brief Optional delay after transmitting a request, in microseconds (µs).
-             *
-             * Some slave devices require a short delay after receiving a request before
-             * they begin transmitting the response (or some USB/RS-485 adapters benefit
-             * from a short settling time).
-             *
-             * Set to 0 to disable.
+             * @brief Optional post-transmit delay in microseconds; used by Linux backend.
+             * @note MCU direction switching is performed after blocking UART TX completes.
              */
             uint32_t TRANSMIT_DELAY_US;
 
@@ -188,12 +222,12 @@ class Modbus
             Parity PARITY;
 
             /**
-             * @brief Number of stop bits (1 or 2).
+             * @brief Stop-bit count (1 or 2); applies to Linux configuration.
              */
             uint8_t STOP_BITS;  
 
             /**
-             * @brief Number of data bits (typically 8).
+             * @brief Data-bit count (typically 8); applies to Linux configuration.
              */
             uint8_t DATA_BITS;   
         }parameters;
@@ -201,13 +235,22 @@ class Modbus
         /**
          * @brief Construct a Modbus communication object.
          *
-         * The serial port is not opened automatically. Configure @ref parameters
-         * and then call @ref openPort().
+         * Initializes default communication parameters. Linux users configure @ref parameters
+         * and call @ref openPort(); MCU users attach `Serial` and the transceiver direction pin
+         * with @ref begin.
          */
         Modbus();
 
         #if !defined(_PLATFORM_PC_)
-            /** Attach project Serial object and RS-485 direction GPIO. TX level means transmit. */
+            /**
+             * @brief Attach the project's Serial wrapper and RS-485 transceiver direction GPIO.
+             * @param serial Initialized Serial wrapper with a valid HAL UART handle.
+             * @param directionPort GPIO port connected to the transceiver DE/RE direction input.
+             * @param directionPin GPIO pin connected to the direction input.
+             * @param transmitLevel GPIO level that selects transmit mode; the opposite selects RX.
+             * @return true when configuration and Serial initialization succeed.
+             * @note Sets Serial TX/RX to blocking mode and initializes it at parameters.BAUDRATE.
+             */
             bool begin(Serial* serial, GPIO_TypeDef* directionPort, uint16_t directionPin,
                         GPIO_PinState transmitLevel = GPIO_PIN_SET);
         #endif
@@ -228,10 +271,10 @@ class Modbus
         Modbus& operator=(Modbus&&) noexcept;
 
         /**
-         * @brief Open and configure the RS-485 serial port.
+         * @brief Open the Linux serial device, or report/return the MCU @ref begin state.
          *
-         * This method opens the device specified by @ref parameters.PORT and configures
-         * the port according to the remaining serial parameters.
+         * Linux opens @ref ParametersStructure::PORT and configures serial framing.
+         * On MCU, call @ref begin first; this method does not open or own the UART.
          *
          * @return true if the port was successfully opened and configured.
          * @return false on failure; see @ref errorMessage.
@@ -246,14 +289,17 @@ class Modbus
         void closePort() noexcept;
 
         /**
-         * @brief Check whether the serial port is open.
+         * @brief Check whether the serial transport is ready.
          *
-         * @return true if the serial port file descriptor is valid.
-         * @return false if the port is not opened.
+         * @return true when Linux has an open file descriptor or MCU has a bound Serial object.
          */
         bool isPortOpen() const noexcept;
 
-        /** Copy error text into the fixed-size, always null-terminated error buffer. */
+        /**
+         * @brief Copy an error message into @ref errorMessage.
+         * @param message Null-terminated text; null is treated as an empty string.
+         * @note Text is truncated to fit and the destination is always null-terminated.
+         */
         void setError(const char* message) noexcept;
 
         // -------------------------------------------------------------------------
@@ -269,7 +315,7 @@ class Modbus
          * @param starting_address First coil address (0-based).
          * @param quantity Number of coils to read (1..2000 per Modbus spec).
          *
-         * @return A vector containing the **data bytes** from the response.
+         * @return A buffer containing the **data bytes** from the response.
          *         Bits are packed LSB-first per Modbus specification.
          *         Returns an empty vector on failure and sets @ref errorMessage.
          */
@@ -284,7 +330,7 @@ class Modbus
          * @param starting_address First discrete input address (0-based).
          * @param quantity Number of discrete inputs to read (1..2000 per Modbus spec).
          *
-         * @return A vector containing the **data bytes** from the response.
+         * @return A buffer containing the **data bytes** from the response.
          *         Bits are packed LSB-first per Modbus specification.
          *         Returns an empty vector on failure and sets @ref errorMessage.
          */
@@ -300,7 +346,7 @@ class Modbus
          * @param starting_address First holding register address (0-based).
          * @param quantity Number of registers to read (1..125 per Modbus spec).
          *
-         * @return A vector containing ONLY the register data bytes:
+         * @return A buffer containing ONLY the register data bytes:
          *         length = `quantity * 2`, big-endian per register (Hi byte then Lo byte).
          *         Returns an empty vector on failure and sets @ref errorMessage.
          */
@@ -330,7 +376,7 @@ class Modbus
          * @param starting_address First input register address (0-based).
          * @param quantity Number of registers to read (1..125 per Modbus spec).
          *
-         * @return A vector containing ONLY the register data bytes:
+         * @return A buffer containing ONLY the register data bytes:
          *         length = `quantity * 2`, big-endian per register (Hi byte then Lo byte).
          *         Returns an empty vector on failure and sets @ref errorMessage.
          */
@@ -390,7 +436,7 @@ class Modbus
          *
          * @param slaveID Modbus slave address.
          * @param starting_address First coil address (0-based).
-         * @param values Vector of coil states to write.
+         * @param values Coil states to write (one boolean per coil; 1..1968 on MCU).
          *
          * @return true on success; false on failure (see @ref errorMessage).
          *
@@ -406,7 +452,7 @@ class Modbus
          *
          * @param slaveID Modbus slave address.
          * @param starting_address First holding register address (0-based).
-         * @param values Vector of register values to write.
+         * @param values Register values to write (1..123 entries).
          *
          * @return true on success; false on failure (see @ref errorMessage).
          *
@@ -435,33 +481,31 @@ class Modbus
         // -------------------------------------------------------------------------
 
         /**
-         * @brief Print a byte vector in hexadecimal format.
+         * @brief Print bytes in hexadecimal format on PC builds.
          *
          * Useful for debugging Modbus frames and responses.
          *
          * @param data Vector of bytes to print.
          *
-         * @note Consider making this function static if it does not access object state.
+         * @note MCU implementation is intentionally a no-op; use the application's logger.
          */
         static void printHex(const ModbusBuffer<uint8_t>& data); 
 
     private:
 
         /**
-         * @brief File descriptor for the RS-485 serial port.
-         *
-         * A value < 0 indicates that the port is not open.
+         * @brief Linux file descriptor; unused by the MCU backend.
          */
         int _serialPort{-1};
         #if !defined(_PLATFORM_PC_)
-            Serial* _serial{nullptr};
-            GPIO_TypeDef* _directionPort{nullptr};
-            uint16_t _directionPin{0};
-            GPIO_PinState _transmitLevel{GPIO_PIN_SET};
+            Serial* _serial{nullptr};                 /**< Non-owning project Serial wrapper. */
+            GPIO_TypeDef* _directionPort{nullptr};    /**< RS-485 direction GPIO port. */
+            uint16_t _directionPin{0};                /**< RS-485 direction GPIO pin mask. */
+            GPIO_PinState _transmitLevel{GPIO_PIN_SET}; /**< Logic level selecting TX mode. */
         #endif
 
         /**
-         * @brief Compute Modbus RTU CRC16 over a byte vector.
+         * @brief Compute Modbus RTU CRC16 over a byte buffer.
          * @param data Input frame bytes (excluding CRC bytes).
          * @return CRC16 value.
          */
@@ -484,7 +528,7 @@ class Modbus
         static bool _verifyCrc(const ModbusBuffer<uint8_t>& frame);
 
         /**
-         * @brief Append Modbus RTU CRC16 to the end of a frame.
+         * @brief Append Modbus RTU CRC16 to the end of a frame buffer.
          *
          * CRC is appended in little-endian wire order: CRC Low byte, then CRC High byte.
          *
@@ -550,7 +594,7 @@ class Modbus
         bool _serialSend(const uint8_t* data, size_t len);
 
         /**
-         * @brief Read exactly @p n bytes from the serial port within a timeout.
+         * @brief Read exactly @p n bytes from the serial transport within a timeout.
          *
          * This helper is typically used by RTU framing code that knows the expected
          * number of bytes to read next (e.g., fixed-length write responses or reading
@@ -559,7 +603,7 @@ class Modbus
          * @param n Number of bytes to read.
          * @param timeout_ms Total timeout in milliseconds.
          *
-         * @return Vector containing exactly @p n bytes on success.
+         * @return Buffer containing exactly @p n bytes on success.
          *         Returns an empty vector on failure (timeout or I/O error) and sets
          *         @ref errorMessage.
          */
@@ -573,8 +617,8 @@ class Modbus
          *
          * @return Number of bytes actually read (0 indicates timeout / no data, depending on implementation).
          *
-         * @warning This overload is lower-level and may be less safe than the vector-based
-         *          exact-length receive. Prefer using the vector-based API for RTU framing.
+         * @warning Internal low-level helper. The caller must provide at least
+         *          @p expected_length writable bytes.
          */
         size_t _serialReceive(size_t expected_length, uint8_t* buffer);
 
@@ -583,7 +627,7 @@ class Modbus
         // -------------------------------------------------------------------------
 
         /**
-         * @brief Receive a Modbus RTU response and return the full response frame.
+         * @brief Receive and validate a Modbus RTU response frame.
          *
          * This function supports:
          * - Fixed-length responses (typical for write single/multiple operations).
@@ -602,7 +646,7 @@ class Modbus
          * @param timeout_ms Total timeout for reading the full response.
          *
          * @return Full Modbus RTU response frame including CRC on success.
-         *         Returns empty vector on failure and sets @ref errorMessage.
+         *         Returns an empty buffer on failure and sets @ref errorMessage.
          */
         ModbusBuffer<uint8_t> _receiveRtuResponse(uint8_t expected_slave, uint8_t expected_function, size_t expected_fixed_len, uint32_t timeout_ms);
         

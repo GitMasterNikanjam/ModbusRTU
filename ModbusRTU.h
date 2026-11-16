@@ -1,12 +1,13 @@
 #pragma once
 
 /**
- * @file ModbusRS485.h
- * @brief Modbus RTU master for Linux and STM32 RS-485 links.
+ * @file ModbusRTU.h
+ * @brief Modbus RTU master for Linux serial ports and STM32 UARTs.
  *
  * Modbus framing, function codes, address handling and CRC are shared by both targets.
- * Linux uses POSIX serial I/O. STM32 uses the project `Serial` wrapper and a GPIO to
- * control the external RS-485 transceiver direction.
+ * RTU is a serial protocol; RS-485 is one possible physical layer. Linux uses POSIX TTY
+ * I/O, while the current STM32 backend uses the project's `Serial` wrapper and requires
+ * a GPIO to control a half-duplex transceiver's direction.
  *
  * @par Addressing convention
  * All public API addresses (coils, discrete inputs, input registers, holding registers)
@@ -133,10 +134,12 @@
 
 /**
  * @class Modbus
- * @brief Modbus RTU master utility for RS-485 serial devices.
+ * @brief Modbus RTU master utility for serial devices.
  *
  * This class provides Modbus RTU master operations over either a Linux serial device
- * or an STM32 HAL UART connected to an external RS-485 transceiver.
+ * or an STM32 HAL UART. The current STM32 transport controls a half-duplex transceiver
+ * through a direction GPIO; the Linux backend relies on the serial device/driver for
+ * any physical-layer direction handling.
  *
  * Supported operations include reading and writing coils and registers using
  * common Modbus function codes.
@@ -244,10 +247,10 @@ class Modbus
 
         #if !defined(_PLATFORM_PC_)
             /**
-             * @brief Attach the project's Serial wrapper and RS-485 transceiver direction GPIO.
+         * @brief Attach the project's Serial wrapper and half-duplex transceiver direction GPIO.
              * @param serial Initialized Serial wrapper with a valid HAL UART handle.
-             * @param directionPort GPIO port connected to the transceiver DE/RE direction input.
-             * @param directionPin GPIO pin connected to the direction input.
+         * @param directionPort GPIO port connected to the transceiver direction input.
+         * @param directionPin GPIO pin connected to the direction input; currently required.
              * @param transmitLevel GPIO level that selects transmit mode; the opposite selects RX.
              * @return true when configuration and Serial initialization succeed.
              * @note Sets Serial TX/RX to blocking mode and initializes it at parameters.BAUDRATE.
@@ -286,8 +289,8 @@ class Modbus
          * @brief Close the Linux descriptor or detach the MCU Serial transport.
          *
          * After calling this, @ref isPortOpen() will return false.
-         * @note On MCU the application-owned HAL UART is not deinitialized; the RS-485
-         *       direction GPIO is returned to receive mode before detaching.
+         * @note On MCU the application-owned HAL UART is not deinitialized; the configured
+         *       half-duplex transceiver direction GPIO is returned to receive mode.
          */
         void closePort() noexcept;
 
@@ -512,8 +515,8 @@ class Modbus
         int _serialPort{-1};
         #if !defined(_PLATFORM_PC_)
             Serial* _serial{nullptr};                 /**< Non-owning project Serial wrapper. */
-            GPIO_TypeDef* _directionPort{nullptr};    /**< RS-485 direction GPIO port. */
-            uint16_t _directionPin{0};                /**< RS-485 direction GPIO pin mask. */
+            GPIO_TypeDef* _directionPort{nullptr};    /**< Half-duplex transceiver direction GPIO port. */
+            uint16_t _directionPin{0};                /**< Transceiver direction GPIO pin mask. */
             GPIO_PinState _transmitLevel{GPIO_PIN_SET}; /**< Logic level selecting TX mode. */
         #endif
 

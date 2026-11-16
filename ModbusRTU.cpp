@@ -2,7 +2,7 @@
 // ################################################################################
 // Include libraries:
 
-#include "ModbusRS485.h"
+#include "ModbusRTU.h"
 #include <cstring>
 #include <cstdio>
 
@@ -72,6 +72,8 @@ Modbus::Modbus(Modbus&& other) noexcept
         _directionPin = other._directionPin;
         _transmitLevel = other._transmitLevel;
         other._serial = nullptr;
+        other._directionPort = nullptr;
+        other._directionPin = 0;
     #endif
 }
 
@@ -91,6 +93,8 @@ Modbus& Modbus::operator=(Modbus&& other) noexcept
         _directionPin = other._directionPin;
         _transmitLevel = other._transmitLevel;
         other._serial = nullptr;
+        other._directionPort = nullptr;
+        other._directionPin = 0;
     #endif
     return *this;
 }
@@ -178,7 +182,7 @@ bool Modbus::openPort(void)
 {
     errorMessage[0] = '\0';
     #if !defined(_PLATFORM_PC_)
-        if (!isPortOpen()) setError("Call begin() with Serial and RS485 DE pin on STM32.");
+        if (!isPortOpen()) setError("Call begin() with Serial and transceiver direction GPIO on STM32.");
         return isPortOpen();
     #else
         if (parameters.PORT.empty())

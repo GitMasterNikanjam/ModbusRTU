@@ -3,7 +3,7 @@ mkdir -p ./bin && g++ ex1.cpp ../*.cpp -o ./bin/ex1
 sudo ./bin/ex1
 */
 
-#include "../ModbusRS485.h"
+#include "../ModbusRTU.h"
 #include <iostream>
 #include <vector>
 #include <cstdint>

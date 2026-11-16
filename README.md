@@ -1,7 +1,6 @@
-# ModbusRS485 (Modbus RTU Master for Linux and STM32)
+# ModbusRTU (Modbus RTU Master for Linux and STM32)
 
-A lightweight **Modbus RTU (RS-485) master** for Linux serial ports and STM32Cube HAL UARTs.
-It supports common Modbus function codes for reading/writing coils and registers, performs CRC16 checks internally, and returns clear error messages via `Modbus::errorMessage`.
+A lightweight **Modbus RTU master over serial** for Linux TTY devices and STM32Cube HAL UARTs. Modbus RTU is the protocol; RS-485 and RS-232 are possible physical interfaces when the connected device and serial adapter support the required signalling. This library does not implement Modbus TCP for Ethernet. It supports common Modbus function codes for reading/writing coils and registers, performs CRC16 checks internally, and reports errors through `Modbus::errorMessage`.
 
 ---
 
@@ -28,20 +27,22 @@ It supports common Modbus function codes for reading/writing coils and registers
 
 The header defines `_PLATFORM_PC_` automatically when compiling on Linux. Linux uses POSIX/termios I/O. Non-Linux builds select the STM32 backend and use the project's `Serial` class; no platform selection define is required from the application. Windows is not a supported backend.
 
-### STM32 RS-485 wiring and setup
+The physical interface is supplied by the serial hardware and its driver. Linux does not configure RS-485 direction ioctls; adapters that need such configuration must be set up separately. The current STM32 `begin()` API requires a GPIO for half-duplex transceiver direction, so automatic-direction adapters and full-duplex interfaces need an appropriate direction-control arrangement.
+
+### STM32 UART and half-duplex transceiver setup
 
 Connect the MCU UART TX/RX to the RS-485 transceiver TXD/RXD. Connect one MCU GPIO to the transceiver direction input (DE and `/RE` tied together if the transceiver requires both). The library drives that GPIO to `transmitLevel` during TX and to the opposite level for RX.
 
 The UART must already be initialized by the application. Configure the project `Serial` object for the selected UART and call:
 
 ```cpp
-Serial rs485Serial;
+Serial uartSerial;
 Modbus modbus;
 
 // Set the application-owned HAL UART; begin() configures Serial in blocking mode.
-rs485Serial.setUart(&huart2);
+uartSerial.setUart(&huart2);
 modbus.parameters.BAUDRATE = 115200; // Serial_STM32 supports 9600, 57600, 115200
-modbus.begin(&rs485Serial, RS485_DIR_GPIO_Port, RS485_DIR_Pin, GPIO_PIN_SET);
+modbus.begin(&uartSerial, TRANSCEIVER_DIR_GPIO_Port, TRANSCEIVER_DIR_Pin, GPIO_PIN_SET);
 ```
 
 Set parity, word length, and stop bits in the Cube/HAL UART configuration to match the slave. Use blocking TX/RX modes; `Modbus::begin()` selects those modes on the supplied `Serial` object. On STM32, `openPort()` is retained for API compatibility and returns the state established by `begin()`.
@@ -57,8 +58,8 @@ Slave ID `0` is accepted by write functions as a Modbus RTU broadcast. The call 
 Typical layout:
 ```
 
-ModbusRS485.h
-ModbusRS485.cpp
+ModbusRTU.h
+ModbusRTU.cpp
 examples/
 ex1.cpp
 
@@ -70,7 +71,7 @@ ex1.cpp
 
 Every address argument in the public API is the exact **zero-based PDU address** sent in the Modbus request. The library does not normalize or convert manual/reference numbers. The function code selects the data table (for example, `0x03` selects Holding Registers); a notation prefix such as `4` in `40001` is not part of the address transmitted on the bus.
 
-Many device manuals use one-based reference numbers such as `40001` for the first Holding Register. In that convention, subtract the table's first reference number to obtain the PDU address: `40001` → `0`, `40002` → `1`, and `40011` → `10`. For example, if a manual labels a Holding Register `40002`, call `readHoldingRegisters(slaveID, 1, quantity, ...)`.
+Many device manuals use one-based reference numbers such as `40001` for the first Holding Register. In that convention, subtract the table's first reference number to obtain the PDU address: `40001` -> `0`, `40002` -> `1`, and `40011` -> `10`. For example, if a manual labels a Holding Register `40002`, call `readHoldingRegisters(slaveID, 1, quantity, ...)`.
 
 Do not assume every vendor uses the same notation or starting offset. Check the device's Modbus examples/register map, then pass the actual PDU address. Some manuals already show zero-based addresses, in which case do not subtract one. Coil and discrete-input references must be interpreted in their own tables in the same way.
 ## Build
@@ -78,7 +79,7 @@ Do not assume every vendor uses the same notation or starting offset. Check the 
 ### Simple compile (example)
 ```bash
 mkdir -p bin
-g++ -std=c++17 -O2 -Wall -Wextra examples/ex1.cpp ModbusRS485.cpp -o bin/ex1
+g++ -std=c++17 -O2 -Wall -Wextra examples/ex1.cpp ModbusRTU.cpp -o bin/ex1
 sudo ./bin/ex1
 ````
 
@@ -97,7 +98,7 @@ sudo usermod -a -G dialout $USER
 ### 1) Configure and open the port
 
 ```cpp
-#include "ModbusRS485.h"
+#include "ModbusRTU.h"
 #include <iostream>
 
 int main() {
@@ -281,7 +282,7 @@ if (data.empty()) {
 
 ## Notes / Best Practices
 
-* **RS-485 direction control:** Some adapters handle DE/RE automatically. Others may require kernel RS-485 mode or GPIO toggling (not handled here).
+* **Direction control:** Direction may be automatic in the adapter or managed by a GPIO/driver. The Linux backend does not configure kernel RS-485 mode; the current STM32 backend controls a transceiver direction GPIO.
 * **Timeout sizing:** Increase `RESPONSE_TIMEOUT_MS` for slow devices or long cable runs.
 * **Bus turnaround delay:** `TRANSMIT_DELAY_US` can help with flaky adapters or strict slaves.
 * **One master at a time:** Don’t open the same `/dev/tty*` from multiple processes.
@@ -302,7 +303,7 @@ Example:
 
 PRs and improvements welcome:
 
-* Optional RS-485 ioctl support (`TIOCSRS485`) for UARTs that support it
+* Optional Linux RS-485 ioctl support (`TIOCSRS485`) for UARTs that support it
 * More examples (reading floats, int32, scaling, bit unpacking helpers)
 * Unit tests for CRC and framing
 

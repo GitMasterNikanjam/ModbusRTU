@@ -26,7 +26,7 @@ It supports common Modbus function codes for reading/writing coils and registers
 
 ## Platform selection
 
-The header defines `_PLATFORM_PC_` automatically using the project's compiler check. Linux uses POSIX/termios I/O. STM32 builds use the project's `Serial` class; no platform selection define is required from the application.
+The header defines `_PLATFORM_PC_` automatically when compiling on Linux. Linux uses POSIX/termios I/O. Non-Linux builds select the STM32 backend and use the project's `Serial` class; no platform selection define is required from the application. Windows is not a supported backend.
 
 ### STM32 RS-485 wiring and setup
 
@@ -45,6 +45,10 @@ modbus.begin(&rs485Serial, RS485_DIR_GPIO_Port, RS485_DIR_Pin, GPIO_PIN_SET);
 ```
 
 Set parity, word length, and stop bits in the Cube/HAL UART configuration to match the slave. Use blocking TX/RX modes; `Modbus::begin()` selects those modes on the supplied `Serial` object. On STM32, `openPort()` is retained for API compatibility and returns the state established by `begin()`.
+
+### Broadcast writes
+
+Slave ID `0` is accepted by write functions as a Modbus RTU broadcast. The call returns `true` when the request frame was transmitted successfully and does not wait for a response, because slaves do not reply to broadcast requests. This confirms transmission only; it cannot confirm that a device accepted or applied the write. Broadcast is rejected for all read functions.
 
 ---
 

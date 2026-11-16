@@ -97,13 +97,7 @@ Modbus& Modbus::operator=(Modbus&& other) noexcept
 
 Modbus::~Modbus()
 {
-    #if defined(_PLATFORM_PC_)
-        if (_serialPort >= 0) 
-        {
-            ::close(_serialPort);
-            _serialPort = -1;
-        }
-    #endif
+    closePort();
 }
 
 void Modbus::closePort() noexcept
@@ -683,6 +677,7 @@ ModbusBuffer<uint8_t> Modbus::readCoils(uint8_t slaveID, uint16_t starting_addre
 {
     errorMessage[0] = '\0';
     if (!isPortOpen()) { setError("Port is closed."); return {}; }
+    if (slaveID == 0 || slaveID > 247) { setError("Invalid slave ID for read (1..247). Broadcast is write-only."); return {}; }
     if (quantity == 0 || quantity > 2000) { setError("Invalid quantity (1..2000)."); return {}; }
 
     const uint16_t addr = starting_address;
@@ -714,6 +709,7 @@ ModbusBuffer<uint8_t> Modbus::readDiscreteInputs(uint8_t slaveID, uint16_t start
 {
     errorMessage[0] = '\0';
     if (!isPortOpen()) { setError("Port is closed."); return {}; }
+    if (slaveID == 0 || slaveID > 247) { setError("Invalid slave ID for read (1..247). Broadcast is write-only."); return {}; }
     if (quantity == 0 || quantity > 2000) { setError("Invalid quantity (1..2000)."); return {}; }
 
     const uint16_t addr = starting_address;
@@ -744,6 +740,7 @@ bool Modbus::writeSingleCoil(uint8_t slaveID, uint16_t address, bool on)
 {
     errorMessage[0] = '\0';
     if (!isPortOpen()) { setError("Port is closed."); return false; }
+    if (slaveID > 247) { setError("Invalid slave ID (0..247). Broadcast uses ID 0."); return false; }
 
     const uint16_t addr = address;
     const uint16_t val  = on ? 0xFF00 : 0x0000;
@@ -755,6 +752,7 @@ bool Modbus::writeSingleCoil(uint8_t slaveID, uint16_t address, bool on)
     _appendCrc(req);
 
     if (!_serialSend(req)) return false;
+    if (slaveID == 0) return true; // Broadcast writes are unacknowledged by Modbus RTU slaves.
 
     // Function 05 echoes the request (8 bytes)
     auto resp = _receiveRtuResponse(slaveID, 0x05, 8, parameters.RESPONSE_TIMEOUT_MS);
@@ -776,6 +774,7 @@ ModbusBuffer<uint8_t> Modbus::readHoldingRegisters(uint8_t slaveID, uint16_t sta
 {
     errorMessage[0] = '\0';
     if (!isPortOpen()) { setError("Read failed. Port is closed."); return {}; }
+    if (slaveID == 0 || slaveID > 247) { setError("Invalid slave ID for read (1..247). Broadcast is write-only."); return {}; }
     if (num_registers == 0 || num_registers > 125) { setError("Invalid quantity (1..125)."); return {}; }
 
     // The API accepts the exact 0-based address carried in the Modbus PDU.
@@ -813,6 +812,7 @@ bool Modbus::readHoldingRegisters(uint8_t slaveID, uint16_t starting_address, ui
     errorMessage[0] = '\0';
     if (!buffer) { setError("Output buffer is null."); return false; }
     if (!isPortOpen()) { setError("Read failed. Port is closed."); return false; }
+    if (slaveID == 0 || slaveID > 247) { setError("Invalid slave ID for read (1..247). Broadcast is write-only."); return false; }
     if (num_registers == 0 || num_registers > 125) { setError("Invalid quantity (1..125)."); return false; }
 
     auto data = readHoldingRegisters(slaveID, starting_address, num_registers);
@@ -834,6 +834,7 @@ ModbusBuffer<uint8_t> Modbus::readInputRegisters(uint8_t slaveID, uint16_t start
 {
     errorMessage[0] = '\0';
     if (!isPortOpen()) { setError("Port is closed."); return {}; }
+    if (slaveID == 0 || slaveID > 247) { setError("Invalid slave ID for read (1..247). Broadcast is write-only."); return {}; }
     if (quantity == 0 || quantity > 125) { setError("Invalid quantity (1..125)."); return {}; }
 
     const uint16_t addr = starting_address;
@@ -866,6 +867,7 @@ bool Modbus::readInputRegisters(uint8_t slaveID, uint16_t starting_address, uint
     errorMessage[0] = '\0';
     if (!out) { setError("Output buffer is null."); return false; }
     if (quantity == 0 || quantity > 125) { setError("Invalid quantity (1..125)."); return false; }
+    if (slaveID == 0 || slaveID > 247) { setError("Invalid slave ID for read (1..247). Broadcast is write-only."); return false; }
 
     auto data = readInputRegisters(slaveID, starting_address, quantity);
     if (data.size() != static_cast<size_t>(quantity) * 2)
@@ -890,6 +892,7 @@ bool Modbus::writeSingleRegister(uint8_t slaveID, uint16_t starting_address, uin
         setError("Modbus port is closed.");
         return false;
     }
+    if (slaveID > 247) { setError("Invalid slave ID (0..247). Broadcast uses ID 0."); return false; }
 
     // 1. Modbus uses 0-based addressing (Manual Register 40030 -> 0x001D)
     const uint16_t address_0based = starting_address;
@@ -912,6 +915,7 @@ bool Modbus::writeSingleRegister(uint8_t slaveID, uint16_t starting_address, uin
     {
         return false;
     }
+    if (slaveID == 0) return true; // Broadcast writes are unacknowledged by Modbus RTU slaves.
 
     // 4. Receive Response (Function 06 echoes the request back exactly)
     // ✅ Use RTU receiver so exception frames (5 bytes) don't cause a timeout hang.
@@ -972,6 +976,7 @@ bool Modbus::writeMultipleCoils(uint8_t slaveID, uint16_t starting_address, cons
 {
     errorMessage[0] = '\0';
     if (!isPortOpen()) { setError("Port is closed."); return false; }
+    if (slaveID > 247) { setError("Invalid slave ID (0..247). Broadcast uses ID 0."); return false; }
     if (values.empty() || values.size() > 1968) { setError("Invalid quantity (1..1968)."); return false; }
 
     const uint16_t addr = starting_address;
@@ -995,6 +1000,7 @@ bool Modbus::writeMultipleCoils(uint8_t slaveID, uint16_t starting_address, cons
     _appendCrc(req);
 
     if (!_serialSend(req)) return false;
+    if (slaveID == 0) return true; // Broadcast writes are unacknowledged by Modbus RTU slaves.
 
     auto resp = _receiveRtuResponse(slaveID, 0x0F, 8, parameters.RESPONSE_TIMEOUT_MS);
     return !resp.empty();
@@ -1004,6 +1010,7 @@ bool Modbus::writeMultipleRegisters(uint8_t slaveID, uint16_t starting_address, 
 {
     errorMessage[0] = '\0';
     if (!isPortOpen()) { setError("Port is closed."); return false; }
+    if (slaveID > 247) { setError("Invalid slave ID (0..247). Broadcast uses ID 0."); return false; }
     if (values.empty() || values.size() > 123) { setError("Invalid quantity (1..123)."); return false; }
 
     uint16_t num_registers = values.size();
@@ -1032,6 +1039,7 @@ bool Modbus::writeMultipleRegisters(uint8_t slaveID, uint16_t starting_address, 
     // printHex(request_data);
 
     if (!_serialSend(request_data)) return false;
+    if (slaveID == 0) return true; // Broadcast writes are unacknowledged by Modbus RTU slaves.
 
     // 4. Receive Response (8 bytes for Function 0x10)
     // Response format: [ID][0x10][AddrH][AddrL][QtyH][QtyL][CRCL][CRCH]
@@ -1056,6 +1064,7 @@ bool Modbus::writeMultipleRegisters(uint8_t slaveID, uint16_t starting_address, 
 {
     errorMessage[0] = '\0';
     if (!isPortOpen()) { setError("Port is closed."); return false; }
+    if (slaveID > 247) { setError("Invalid slave ID (0..247). Broadcast uses ID 0."); return false; }
     if (values == nullptr) { setError("Register source is null."); return false; }
     if (num_registers == 0 || num_registers > 123)
     {
@@ -1088,6 +1097,7 @@ bool Modbus::writeMultipleRegisters(uint8_t slaveID, uint16_t starting_address, 
     // printHex(request_data);
 
     if (!_serialSend(request_data)) return false;
+    if (slaveID == 0) return true; // Broadcast writes are unacknowledged by Modbus RTU slaves.
 
     // 4. Receive Response (8 bytes for Function 0x10)
     // Response format: [ID][0x10][AddrH][AddrL][QtyH][QtyL][CRCL][CRCH]

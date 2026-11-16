@@ -2,7 +2,7 @@
 
 /**
  * @file ModbusRS485.h
- * @brief Cross-platform Modbus RTU master for Linux and STM32 RS-485 links.
+ * @brief Modbus RTU master for Linux and STM32 RS-485 links.
  *
  * Modbus framing, function codes, address handling and CRC are shared by both targets.
  * Linux uses POSIX serial I/O. STM32 uses the project `Serial` wrapper and a GPIO to
@@ -36,11 +36,11 @@
 
 /**
  * @def _PLATFORM_PC_
- * @brief Automatically marks hosted PC builds (Linux/Windows) using the project's compiler test.
+ * @brief Automatically marks Linux builds; all non-Linux builds use the STM32 backend.
  *
  * When this macro is absent, the header selects the STM32 backend and includes `Serial.h`.
  */
-#if defined(__linux__) || defined(_WIN32) && !defined(__CC_ARM) && !defined(__ARMCOMPILER_VERSION)
+#if defined(__linux__)
     #define _PLATFORM_PC_
 #endif
 
@@ -259,7 +259,7 @@ class Modbus
         /**
          * @brief Destructor.
          *
-         * Automatically closes the serial port if it is open.
+         * Closes the Linux port or returns the MCU transceiver direction to receive mode.
          */
         ~Modbus();
 
@@ -314,7 +314,7 @@ class Modbus
          *
          * Coils are single-bit read/write discrete outputs.
          *
-         * @param slaveID Modbus slave address (1..247 typically; 0 is broadcast for writes only).
+         * @param slaveID Modbus slave address (1..247); broadcast address 0 is not valid for reads.
          * @param starting_address First coil address (0-based).
          * @param quantity Number of coils to read (1..2000 per Modbus spec).
          *
@@ -329,7 +329,7 @@ class Modbus
          *
          * Discrete inputs are single-bit read-only inputs.
          *
-         * @param slaveID Modbus slave address.
+         * @param slaveID Modbus slave address (1..247); broadcast address 0 is not valid for reads.
          * @param starting_address First discrete input address (0-based).
          * @param quantity Number of discrete inputs to read (1..2000 per Modbus spec).
          *
@@ -345,7 +345,7 @@ class Modbus
          * Holding registers are 16-bit read/write registers commonly used for configuration
          * and writable outputs.
          *
-         * @param slaveID Modbus slave address.
+         * @param slaveID Modbus slave address (1..247); broadcast address 0 is not valid for reads.
          * @param starting_address First holding register address (0-based).
          * @param quantity Number of registers to read (1..125 per Modbus spec).
          *
@@ -358,7 +358,7 @@ class Modbus
         /**
          * @brief Read holding registers (Function Code 0x03) into a caller-provided buffer.
          *
-         * @param slaveID Modbus slave address.
+         * @param slaveID Modbus slave address (1..247); broadcast address 0 is not valid for reads.
          * @param starting_address First holding register address (0-based).
          * @param quantity Number of registers to read (1..125 per Modbus spec).
          * @param buffer Output buffer of length at least `quantity` (uint16_t words).
@@ -375,7 +375,7 @@ class Modbus
          *
          * Input registers are 16-bit read-only registers commonly used for sensor/measurement values.
          *
-         * @param slaveID Modbus slave address.
+         * @param slaveID Modbus slave address (1..247); broadcast address 0 is not valid for reads.
          * @param starting_address First input register address (0-based).
          * @param quantity Number of registers to read (1..125 per Modbus spec).
          *
@@ -388,7 +388,7 @@ class Modbus
         /**
          * @brief Read input registers (Function Code 0x04) into a caller-provided buffer.
          *
-         * @param slaveID Modbus slave address.
+         * @param slaveID Modbus slave address (1..247); broadcast address 0 is not valid for reads.
          * @param starting_address First input register address (0-based).
          * @param quantity Number of registers to read (1..125 per Modbus spec).
          * @param buffer Output buffer of length at least `quantity` (uint16_t words).
@@ -406,11 +406,13 @@ class Modbus
          *
          * Writes the ON/OFF state of a single coil.
          *
-         * @param slaveID Modbus slave address.
+         * @param slaveID Modbus slave address (0 for broadcast, 1..247 for an individual slave).
          * @param address Coil address (0-based).
          * @param state Desired coil state (`true` = ON, `false` = OFF).
          *
-         * @return true on success; false on failure (see @ref errorMessage).
+         * @return true on acknowledged unicast success, or when a broadcast frame was sent;
+         *         false on failure (see @ref errorMessage). Broadcast success does not confirm
+         *         that any slave applied the command because broadcast requests receive no reply.
          *
          * @note Modbus encoding uses 0xFF00 for ON and 0x0000 for OFF in the protocol.
          */
@@ -421,11 +423,13 @@ class Modbus
          *
          * Writes one 16-bit value to a holding register.
          *
-         * @param slaveID Modbus slave address.
+         * @param slaveID Modbus slave address (0 for broadcast, 1..247 for an individual slave).
          * @param address Holding register address (0-based).
          * @param value 16-bit value to write.
          *
-         * @return true on success; false on failure (see @ref errorMessage).
+         * @return true on acknowledged unicast success, or when a broadcast frame was sent;
+         *         false on failure (see @ref errorMessage). Broadcast success does not confirm
+         *         that any slave applied the command because broadcast requests receive no reply.
          *
          * @note The normal response echoes the address and value. Implementations should
          *       validate this echo and CRC.
@@ -437,11 +441,13 @@ class Modbus
          *
          * Writes multiple consecutive coils. Coil values are provided as booleans in @p values.
          *
-         * @param slaveID Modbus slave address.
+         * @param slaveID Modbus slave address (0 for broadcast, 1..247 for an individual slave).
          * @param starting_address First coil address (0-based).
          * @param values Coil states to write (one boolean per coil; 1..1968 on MCU).
          *
-         * @return true on success; false on failure (see @ref errorMessage).
+         * @return true on acknowledged unicast success, or when a broadcast frame was sent;
+         *         false on failure (see @ref errorMessage). Broadcast success does not confirm
+         *         that any slave applied the command because broadcast requests receive no reply.
          *
          * @note Modbus packs coil bits LSB-first into bytes. The implementation must pack
          *       @p values accordingly.
@@ -453,11 +459,13 @@ class Modbus
          *
          * Writes multiple consecutive 16-bit values to holding registers.
          *
-         * @param slaveID Modbus slave address.
+         * @param slaveID Modbus slave address (0 for broadcast, 1..247 for an individual slave).
          * @param starting_address First holding register address (0-based).
          * @param values Register values to write (1..123 entries).
          *
-         * @return true on success; false on failure (see @ref errorMessage).
+         * @return true on acknowledged unicast success, or when a broadcast frame was sent;
+         *         false on failure (see @ref errorMessage). Broadcast success does not confirm
+         *         that any slave applied the command because broadcast requests receive no reply.
          *
          * @note Modbus specifies a maximum of 123 registers per 0x10 request.
          */
@@ -468,12 +476,14 @@ class Modbus
          *
          * This overload avoids allocations and is suitable for high-frequency writes.
          *
-         * @param slaveID Modbus slave address.
+         * @param slaveID Modbus slave address (0 for broadcast, 1..247 for an individual slave).
          * @param starting_address First holding register address (0-based).
          * @param quantity Number of registers to write (must match the size of @p values).
          * @param values Pointer to an array of length at least @p quantity.
          *
-         * @return true on success; false on failure (see @ref errorMessage).
+         * @return true on acknowledged unicast success, or when a broadcast frame was sent;
+         *         false on failure (see @ref errorMessage). Broadcast success does not confirm
+         *         that any slave applied the command because broadcast requests receive no reply.
          *
          * @note Modbus specifies a maximum of 123 registers per 0x10 request.
          */

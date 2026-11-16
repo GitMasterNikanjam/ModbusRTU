@@ -3,7 +3,7 @@ mkdir -p ./bin && g++ ex1.cpp ../*.cpp -o ./bin/ex1
 sudo ./bin/ex1
 */
 
-#include "../ModbusLinuxRS485.h"
+#include "../ModbusRS485.h"
 #include <iostream>
 #include <vector>
 #include <cstdint>
@@ -27,8 +27,8 @@ int main()
         return 1;
     }
 
-    // Read 2 holding registers starting at 40351
-    auto response = modbus.readHoldingRegisters(SLAVE_ID, 40351, 2);
+    // Read 2 holding registers starting at protocol address 350 (document reference 40351).
+    auto response = modbus.readHoldingRegisters(SLAVE_ID, 350, 2);
 
     if (!response.empty())
     {
@@ -56,10 +56,10 @@ int main()
         static_cast<uint16_t>(u & 0xFFFF)
     };
 
-    if (!modbus.writeMultipleRegisters(SLAVE_ID, 40351, regs))
+    if (!modbus.writeMultipleRegisters(SLAVE_ID, 350, regs))
         std::cerr << "WriteMultipleRegisters failed: " << modbus.errorMessage << "\n";
 
-    if (!modbus.writeSingleRegister(SLAVE_ID, 40125, 0x0067))
+    if (!modbus.writeSingleRegister(SLAVE_ID, 124, 0x0067))
         std::cerr << "WriteSingleRegister failed: " << modbus.errorMessage << "\n";
 
     return 0;

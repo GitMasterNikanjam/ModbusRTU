@@ -53,8 +53,8 @@ Set parity, word length, and stop bits in the Cube/HAL UART configuration to mat
 Typical layout:
 ```
 
-ModbusLinuxRS485.h
-ModbusLinuxRS485.cpp
+ModbusRS485.h
+ModbusRS485.cpp
 examples/
 ex1.cpp
 
@@ -62,32 +62,19 @@ ex1.cpp
 
 ---
 
-## Addressing (Important)
+## Addressing
 
-### What the header says
-The header documentation states: **public API addresses are 0-based Modbus protocol addresses**:
-- Holding register “40001” → address `0`
-- Input register  “30001” → address `0`
-- Coil           “00001” → address `0`
-- Discrete input “10001” → address `0`
+Every address argument in the public API is the exact **zero-based PDU address** sent in the Modbus request. The library does not normalize or convert manual/reference numbers. The function code selects the data table (for example, `0x03` selects Holding Registers); a notation prefix such as `4` in `40001` is not part of the address transmitted on the bus.
 
-### What the implementation currently does
-The implementation includes “normalization” helpers like `_normalizeHoldingRegisterAddress()` that may convert `40001..49999` style inputs into 0-based addresses.
+Many device manuals use one-based reference numbers such as `40001` for the first Holding Register. In that convention, subtract the table's first reference number to obtain the PDU address: `40001` → `0`, `40002` → `1`, and `40011` → `10`. For example, if a manual labels a Holding Register `40002`, call `readHoldingRegisters(slaveID, 1, quantity, ...)`.
 
-✅ Practical guidance:
-- **Preferred (recommended):** Always pass **0-based** addresses.
-- **If you pass “4xxxx/3xxxx/1xxxx/0xxxx” style addresses:** the library may normalize them (best-effort), but you should treat that as a convenience, not the strict contract.
-
-If you want strict behavior, keep your application 0-based and avoid relying on normalization.
-
----
-
+Do not assume every vendor uses the same notation or starting offset. Check the device's Modbus examples/register map, then pass the actual PDU address. Some manuals already show zero-based addresses, in which case do not subtract one. Coil and discrete-input references must be interpreted in their own tables in the same way.
 ## Build
 
 ### Simple compile (example)
 ```bash
 mkdir -p bin
-g++ -std=c++17 -O2 -Wall -Wextra examples/ex1.cpp ModbusLinuxRS485.cpp -o bin/ex1
+g++ -std=c++17 -O2 -Wall -Wextra examples/ex1.cpp ModbusRS485.cpp -o bin/ex1
 sudo ./bin/ex1
 ````
 
@@ -106,7 +93,7 @@ sudo usermod -a -G dialout $USER
 ### 1) Configure and open the port
 
 ```cpp
-#include "ModbusLinuxRS485.h"
+#include "ModbusRS485.h"
 #include <iostream>
 
 int main() {
@@ -311,7 +298,6 @@ Example:
 
 PRs and improvements welcome:
 
-* Better strictness around addressing (optional “strict 0-based mode”)
 * Optional RS-485 ioctl support (`TIOCSRS485`) for UARTs that support it
 * More examples (reading floats, int32, scaling, bit unpacking helpers)
 * Unit tests for CRC and framing

@@ -3,7 +3,7 @@ mkdir -p ./bin && g++ ex2.cpp ../*.cpp -o ./bin/ex2
 sudo ./bin/ex2
 */
 
-#include "../ModbusLinuxRS485.h"
+#include "../ModbusRS485.h"
 #include <iostream>
 #include <vector>
 #include <cstdint>
@@ -13,7 +13,7 @@ sudo ./bin/ex2
 #define BAUD_RATE     115200
 #define SLAVE_ID      1
 
-#define REG_ENCODER_POSITION                    40011
+#define REG_ENCODER_POSITION                    10 // documented register 40011
 #define LEN_ENCODER_POSITION                    2
 
 int main()

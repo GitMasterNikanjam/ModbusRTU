@@ -114,7 +114,17 @@ void Modbus::closePort() noexcept
             ::close(_serialPort);
             _serialPort = -1;
         }
+    #else
+        if (_directionPort != nullptr && _directionPin != 0)
+        {
+            HAL_GPIO_WritePin(_directionPort, _directionPin,
+                              _transmitLevel == GPIO_PIN_SET ? GPIO_PIN_RESET : GPIO_PIN_SET);
+        }
+        _serial = nullptr;
+        _directionPort = nullptr;
+        _directionPin = 0;
     #endif
+    errorMessage[0] = '\0';
 }
 
 void Modbus::setError(const char* message) noexcept
@@ -137,6 +147,7 @@ bool Modbus::isPortOpen() const noexcept
     bool Modbus::begin(Serial* serial, GPIO_TypeDef* directionPort, uint16_t directionPin,
                         GPIO_PinState transmitLevel)
     {
+        errorMessage[0] = '\0';
         if (serial == nullptr || serial->getUart() == nullptr ||
             directionPort == nullptr || directionPin == 0)
         {
@@ -171,6 +182,7 @@ bool Modbus::isPortOpen() const noexcept
 
 bool Modbus::openPort(void)
 {
+    errorMessage[0] = '\0';
     #if !defined(_PLATFORM_PC_)
         if (!isPortOpen()) setError("Call begin() with Serial and RS485 DE pin on STM32.");
         return isPortOpen();
@@ -377,11 +389,24 @@ bool Modbus::_serialSend(const uint8_t* data, size_t len)
 
 size_t Modbus::_serialReceive(size_t expected_length, uint8_t* buffer)
 {
+    if (buffer == nullptr)
+    {
+        setError("Receive buffer is null.");
+        return 0;
+    }
     if (!isPortOpen())
     {
         setError("Receive failed, port is closed.");
         return 0;
     }
+
+    #if !defined(_PLATFORM_PC_)
+        if (expected_length > ModbusBuffer<uint8_t>::capacity())
+        {
+            setError("UART receive length exceeds buffer.");
+            return 0;
+        }
+    #endif
 
     #if defined(_PLATFORM_PC_)
         ssize_t n = ::read(_serialPort, buffer, expected_length);
@@ -418,6 +443,14 @@ ModbusBuffer<uint8_t> Modbus::_serialReceive(size_t n, uint32_t timeout_ms)
         setError("Receive failed: port is closed.");
         return {};
     }
+
+    #if !defined(_PLATFORM_PC_)
+        if (n > ModbusBuffer<uint8_t>::capacity())
+        {
+            setError("UART receive length exceeds buffer.");
+            return {};
+        }
+    #endif
 
     #if defined(_PLATFORM_PC_)
         ModbusBuffer<uint8_t> out;
@@ -514,6 +547,11 @@ bool Modbus::_validateBasicResponse(const ModbusBuffer<uint8_t>& resp,
         setError("Slave ID mismatch.");
         return false;
     }
+    if (!_verifyCrc(resp))
+    {
+        setError("CRC mismatch in response.");
+        return false;
+    }
     // Exception response?
     if (resp[1] == static_cast<uint8_t>(expected_function | 0x80))
     {
@@ -526,11 +564,6 @@ bool Modbus::_validateBasicResponse(const ModbusBuffer<uint8_t>& resp,
     if (resp[1] != expected_function)
     {
         setError("Function code mismatch.");
-        return false;
-    }
-    if (!_verifyCrc(resp))
-    {
-        setError("CRC mismatch in response.");
         return false;
     }
     return true;
@@ -569,8 +602,19 @@ ModbusBuffer<uint8_t> Modbus::_receiveRtuResponse(uint8_t expected_slave,
         uint32_t rem = remaining_ms();
         if (rem == 0) { setError("Timeout before reading fixed response."); return {}; }
 
-        auto resp = _serialReceive(expected_fixed_len, rem);
-        if (resp.empty()) return {};
+        // Read the function code first so a legal 5-byte Modbus exception response
+        // is not mistaken for a truncated 8-byte write echo.
+        auto header = _serialReceive(2, rem);
+        if (header.size() != 2) return {};
+        const bool is_exception = header[1] == static_cast<uint8_t>(expected_function | 0x80);
+        const size_t tail_length = is_exception ? 3 : expected_fixed_len - 2;
+        rem = remaining_ms();
+        if (rem == 0) { setError("Timeout reading response tail."); return {}; }
+        auto tail = _serialReceive(tail_length, rem);
+        if (tail.size() != tail_length) return {};
+        ModbusBuffer<uint8_t> resp;
+        resp.insert(resp.end(), header.begin(), header.end());
+        resp.insert(resp.end(), tail.begin(), tail.end());
         if (!_validateBasicResponse(resp, expected_slave, expected_function)) return {};
         return resp;
     }
@@ -607,6 +651,11 @@ ModbusBuffer<uint8_t> Modbus::_receiveRtuResponse(uint8_t expected_slave,
     auto third = _serialReceive(1, rem);
     if (third.empty()) return {};
     const uint8_t byteCount = third[0];
+    if (byteCount > 250)
+    {
+        setError("Response byte count exceeds Modbus limit.");
+        return {};
+    }
 
     // Remaining = byteCount data + CRC2
 
@@ -632,10 +681,11 @@ ModbusBuffer<uint8_t> Modbus::_receiveRtuResponse(uint8_t expected_slave,
 
 ModbusBuffer<uint8_t> Modbus::readCoils(uint8_t slaveID, uint16_t starting_address, uint16_t quantity)
 {
+    errorMessage[0] = '\0';
     if (!isPortOpen()) { setError("Port is closed."); return {}; }
     if (quantity == 0 || quantity > 2000) { setError("Invalid quantity (1..2000)."); return {}; }
 
-    const uint16_t addr = _normalizeCoilAddress(starting_address);
+    const uint16_t addr = starting_address;
 
     ModbusBuffer<uint8_t> req;
     req.push_back(slaveID); req.push_back(0x01);
@@ -662,10 +712,11 @@ ModbusBuffer<uint8_t> Modbus::readCoils(uint8_t slaveID, uint16_t starting_addre
 
 ModbusBuffer<uint8_t> Modbus::readDiscreteInputs(uint8_t slaveID, uint16_t starting_address, uint16_t quantity)
 {
+    errorMessage[0] = '\0';
     if (!isPortOpen()) { setError("Port is closed."); return {}; }
     if (quantity == 0 || quantity > 2000) { setError("Invalid quantity (1..2000)."); return {}; }
 
-    const uint16_t addr = _normalizeDiscreteInputAddress(starting_address);
+    const uint16_t addr = starting_address;
 
     ModbusBuffer<uint8_t> req;
     req.push_back(slaveID); req.push_back(0x02);
@@ -691,9 +742,10 @@ ModbusBuffer<uint8_t> Modbus::readDiscreteInputs(uint8_t slaveID, uint16_t start
 
 bool Modbus::writeSingleCoil(uint8_t slaveID, uint16_t address, bool on)
 {
+    errorMessage[0] = '\0';
     if (!isPortOpen()) { setError("Port is closed."); return false; }
 
-    const uint16_t addr = _normalizeCoilAddress(address);
+    const uint16_t addr = address;
     const uint16_t val  = on ? 0xFF00 : 0x0000;
 
     ModbusBuffer<uint8_t> req;
@@ -722,12 +774,12 @@ bool Modbus::writeSingleCoil(uint8_t slaveID, uint16_t address, bool on)
 
 ModbusBuffer<uint8_t> Modbus::readHoldingRegisters(uint8_t slaveID, uint16_t starting_address, uint16_t num_registers)
 {
+    errorMessage[0] = '\0';
     if (!isPortOpen()) { setError("Read failed. Port is closed."); return {}; }
     if (num_registers == 0 || num_registers > 125) { setError("Invalid quantity (1..125)."); return {}; }
 
-    // 1. Build the Modbus Request (6 bytes)
-    // Modbus 4XXXX registers use 0-based addressing (40001 -> 0x0000)
-    const uint16_t addr = _normalizeHoldingRegisterAddress(starting_address);
+    // The API accepts the exact 0-based address carried in the Modbus PDU.
+    const uint16_t addr = starting_address;
 
     ModbusBuffer<uint8_t> req;
     req.push_back(slaveID); req.push_back(0x03);
@@ -758,6 +810,7 @@ ModbusBuffer<uint8_t> Modbus::readHoldingRegisters(uint8_t slaveID, uint16_t sta
 
 bool Modbus::readHoldingRegisters(uint8_t slaveID, uint16_t starting_address, uint16_t num_registers, uint16_t* buffer)
 {
+    errorMessage[0] = '\0';
     if (!buffer) { setError("Output buffer is null."); return false; }
     if (!isPortOpen()) { setError("Read failed. Port is closed."); return false; }
     if (num_registers == 0 || num_registers > 125) { setError("Invalid quantity (1..125)."); return false; }
@@ -779,10 +832,11 @@ bool Modbus::readHoldingRegisters(uint8_t slaveID, uint16_t starting_address, ui
 
 ModbusBuffer<uint8_t> Modbus::readInputRegisters(uint8_t slaveID, uint16_t starting_address, uint16_t quantity)
 {
+    errorMessage[0] = '\0';
     if (!isPortOpen()) { setError("Port is closed."); return {}; }
     if (quantity == 0 || quantity > 125) { setError("Invalid quantity (1..125)."); return {}; }
 
-    const uint16_t addr = _normalizeInputRegisterAddress(starting_address);
+    const uint16_t addr = starting_address;
 
     ModbusBuffer<uint8_t> req;
     req.push_back(slaveID); req.push_back(0x04);
@@ -809,6 +863,7 @@ ModbusBuffer<uint8_t> Modbus::readInputRegisters(uint8_t slaveID, uint16_t start
 
 bool Modbus::readInputRegisters(uint8_t slaveID, uint16_t starting_address, uint16_t quantity, uint16_t* out)
 {
+    errorMessage[0] = '\0';
     if (!out) { setError("Output buffer is null."); return false; }
     if (quantity == 0 || quantity > 125) { setError("Invalid quantity (1..125)."); return false; }
 
@@ -829,6 +884,7 @@ bool Modbus::readInputRegisters(uint8_t slaveID, uint16_t starting_address, uint
 
 bool Modbus::writeSingleRegister(uint8_t slaveID, uint16_t starting_address, uint16_t value) 
 {
+    errorMessage[0] = '\0';
     if (!isPortOpen()) 
     {
         setError("Modbus port is closed.");
@@ -836,7 +892,7 @@ bool Modbus::writeSingleRegister(uint8_t slaveID, uint16_t starting_address, uin
     }
 
     // 1. Modbus uses 0-based addressing (Manual Register 40030 -> 0x001D)
-    uint16_t address_0based = _normalizeHoldingRegisterAddress(starting_address);
+    const uint16_t address_0based = starting_address;
 
     // 2. Build the Modbus Request (6 bytes + 2 CRC)
     ModbusBuffer<uint8_t> request_data;
@@ -872,8 +928,7 @@ bool Modbus::writeSingleRegister(uint8_t slaveID, uint16_t starting_address, uin
     auto response = _receiveRtuResponse(slaveID, 0x06, 8, parameters.RESPONSE_TIMEOUT_MS);
     if (response.empty()) 
     {
-        setError("Modbus response is empty.");
-        return false;   // errorMessage already set 
+        return false; // Preserve a more specific timeout/exception/CRC message.
     }
 
 
@@ -915,10 +970,11 @@ bool Modbus::writeSingleRegister(uint8_t slaveID, uint16_t starting_address, uin
 
 bool Modbus::writeMultipleCoils(uint8_t slaveID, uint16_t starting_address, const ModbusBuffer<bool>& values)
 {
+    errorMessage[0] = '\0';
     if (!isPortOpen()) { setError("Port is closed."); return false; }
     if (values.empty() || values.size() > 1968) { setError("Invalid quantity (1..1968)."); return false; }
 
-    const uint16_t addr = _normalizeCoilAddress(starting_address);
+    const uint16_t addr = starting_address;
     const uint16_t qty  = static_cast<uint16_t>(values.size());
     const uint16_t byteCount = static_cast<uint16_t>((qty + 7) / 8);
 
@@ -946,11 +1002,12 @@ bool Modbus::writeMultipleCoils(uint8_t slaveID, uint16_t starting_address, cons
 
 bool Modbus::writeMultipleRegisters(uint8_t slaveID, uint16_t starting_address, const ModbusBuffer<uint16_t>& values) 
 {
+    errorMessage[0] = '\0';
     if (!isPortOpen()) { setError("Port is closed."); return false; }
     if (values.empty() || values.size() > 123) { setError("Invalid quantity (1..123)."); return false; }
 
     uint16_t num_registers = values.size();
-    uint16_t address_0based = _normalizeHoldingRegisterAddress(starting_address);
+    const uint16_t address_0based = starting_address;
 
     // 1. Build the Modbus Request Header
     ModbusBuffer<uint8_t> request_data;
@@ -997,9 +1054,16 @@ bool Modbus::writeMultipleRegisters(uint8_t slaveID, uint16_t starting_address, 
 
 bool Modbus::writeMultipleRegisters(uint8_t slaveID, uint16_t starting_address, uint16_t num_registers, const uint16_t* values)
 {
-    if (!isPortOpen() || (values == nullptr)) return false;
+    errorMessage[0] = '\0';
+    if (!isPortOpen()) { setError("Port is closed."); return false; }
+    if (values == nullptr) { setError("Register source is null."); return false; }
+    if (num_registers == 0 || num_registers > 123)
+    {
+        setError("Invalid quantity (1..123).");
+        return false;
+    }
 
-    uint16_t address_0based = _normalizeHoldingRegisterAddress(starting_address);
+    const uint16_t address_0based = starting_address;
 
     // 1. Build the Modbus Request Header
     ModbusBuffer<uint8_t> request_data;
@@ -1115,30 +1179,4 @@ void Modbus::_appendCrc(ModbusBuffer<uint8_t>& frame)
     const uint16_t crc = Modbus::_crc16_modbus(frame.data(), frame.size());
     frame.push_back(static_cast<uint8_t>(crc & 0xFF));
     frame.push_back(static_cast<uint8_t>(crc >> 8));
-}
-
-// ------------------------
-// Address normalization
-// ------------------------
-// Default: 0-based. Best-effort auto-normalize common human notations.
-uint16_t Modbus::_normalizeHoldingRegisterAddress(uint16_t addr)
-{
-    if (addr >= 40001 && addr <= 49999) return static_cast<uint16_t>(addr - 40001);
-    return addr;
-}
-uint16_t Modbus::_normalizeInputRegisterAddress(uint16_t addr)
-{
-    if (addr >= 30001 && addr <= 39999) return static_cast<uint16_t>(addr - 30001);
-    return addr;
-}
-uint16_t Modbus::_normalizeCoilAddress(uint16_t addr)
-{
-    // Some people use 00001-based coil numbers
-    if (addr >= 1 && addr <= 9999) return static_cast<uint16_t>(addr - 1);
-    return addr;
-}
-uint16_t Modbus::_normalizeDiscreteInputAddress(uint16_t addr)
-{
-    if (addr >= 10001 && addr <= 19999) return static_cast<uint16_t>(addr - 10001);
-    return addr;
 }

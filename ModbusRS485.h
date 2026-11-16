@@ -16,8 +16,7 @@
  * - Coil            "00001" in documentation corresponds to address `0`.
  * - Discrete input  "10001" in documentation corresponds to address `0`.
  *
- * Some implementations optionally normalize "4xxxx/3xxxx/0xxxx/1xxxx" style addresses;
- * however, the contract of this header is strictly 0-based addresses.
+ * Human-readable "4xxxx/3xxxx/1xxxx" references must be converted by the caller.
  *
  * @par Protocol
  * This is **Modbus RTU** (binary, CRC-based) over serial. It is not Modbus TCP.
@@ -76,6 +75,8 @@
         typedef const T* const_iterator;
         /** @brief Construct an empty fixed-capacity buffer. */
         ModbusBuffer() : size_(0) {}
+        /** @brief Construct a buffer with @p count default-initialized elements, clamped to capacity. */
+        explicit ModbusBuffer(size_t count) : size_(0) { resize(count); }
         /** @brief Construct a buffer by copying the half-open input range. */
         template <typename It> ModbusBuffer(It first, It last) : size_(0) { insert(end(), first, last); }
         /** @brief Number of populated elements. */
@@ -282,9 +283,11 @@ class Modbus
         bool openPort();
 
         /**
-         * @brief Close the serial port if it is open.
+         * @brief Close the Linux descriptor or detach the MCU Serial transport.
          *
          * After calling this, @ref isPortOpen() will return false.
+         * @note On MCU the application-owned HAL UART is not deinitialized; the RS-485
+         *       direction GPIO is returned to receive mode before detaching.
          */
         void closePort() noexcept;
 
@@ -535,42 +538,6 @@ class Modbus
          * @param frame Frame to append CRC onto.
          */
         static void _appendCrc(ModbusBuffer<uint8_t>& frame);
-
-        // -------------------------------------------------------------------------
-        // Address normalization helpers (optional)
-        // -------------------------------------------------------------------------
-        
-        /**
-         * @brief Normalize a holding register address.
-         *
-         * Intended to optionally convert documented 4xxxx-style addresses into 0-based
-         * protocol addresses. Exact behavior depends on implementation.
-         *
-         * @param addr Address value provided by caller.
-         * @return Normalized 0-based address.
-         */
-        static uint16_t _normalizeHoldingRegisterAddress(uint16_t addr);
-
-        /**
-         * @brief Normalize an input register address (optional 3xxxx-style to 0-based).
-         * @param addr Address value provided by caller.
-         * @return Normalized 0-based address.
-         */
-        static uint16_t _normalizeInputRegisterAddress(uint16_t addr);
-
-        /**
-         * @brief Normalize a coil address (optional 0xxxx-style to 0-based).
-         * @param addr Address value provided by caller.
-         * @return Normalized 0-based address.
-         */
-        static uint16_t _normalizeCoilAddress(uint16_t addr);
-
-        /**
-         * @brief Normalize a discrete input address (optional 1xxxx-style to 0-based).
-         * @param addr Address value provided by caller.
-         * @return Normalized 0-based address.
-         */
-        static uint16_t _normalizeDiscreteInputAddress(uint16_t addr);
 
         // -------------------------------------------------------------------------
         // Serial I/O helpers

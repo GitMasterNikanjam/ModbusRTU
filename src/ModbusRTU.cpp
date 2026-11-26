@@ -21,6 +21,7 @@
     #include <iostream>
 #else
     #include "Serial.h"
+    #include "ModbusMCUInterruptTransport.h"
 #endif
 
 // ################################################################################
@@ -68,10 +69,12 @@ Modbus::Modbus(Modbus&& other) noexcept
     other._serialPort = -1;
     #if !defined(_PLATFORM_PC_)
         _serial = other._serial;
+        _transport = other._transport;
         _directionPort = other._directionPort;
         _directionPin = other._directionPin;
         _transmitLevel = other._transmitLevel;
         other._serial = nullptr;
+        other._transport = nullptr;
         other._directionPort = nullptr;
         other._directionPin = 0;
     #endif
@@ -89,10 +92,12 @@ Modbus& Modbus::operator=(Modbus&& other) noexcept
     other._serialPort = -1;
     #if !defined(_PLATFORM_PC_)
         _serial = other._serial;
+        _transport = other._transport;
         _directionPort = other._directionPort;
         _directionPin = other._directionPin;
         _transmitLevel = other._transmitLevel;
         other._serial = nullptr;
+        other._transport = nullptr;
         other._directionPort = nullptr;
         other._directionPin = 0;
     #endif
@@ -119,6 +124,7 @@ void Modbus::closePort() noexcept
                               _transmitLevel == GPIO_PIN_SET ? GPIO_PIN_RESET : GPIO_PIN_SET);
         }
         _serial = nullptr;
+        _transport = nullptr;
         _directionPort = nullptr;
         _directionPin = 0;
     #endif
@@ -142,6 +148,18 @@ bool Modbus::isPortOpen() const noexcept
 }
 
 #if !defined(_PLATFORM_PC_)
+bool Modbus::enableMCUInterruptTransport(ModbusMCUInterruptTransport& transport) noexcept
+    {
+        if (!isPortOpen() || _serial->getUart() == nullptr)
+        {
+            setError("Initialize the Modbus UART before enabling its interrupt transport.");
+            return false;
+        }
+        transport.attach(_serial->getUart(), _directionPort, _directionPin, _transmitLevel);
+        _transport = &transport;
+        return true;
+    }
+
     bool Modbus::begin(Serial* serial, GPIO_TypeDef* directionPort, uint16_t directionPin,
                         GPIO_PinState transmitLevel)
     {
@@ -167,6 +185,7 @@ bool Modbus::isPortOpen() const noexcept
             setError("Serial begin failed.");
             return false;
         }
+        _transport = nullptr;
         serial->setTimeout(parameters.RESPONSE_TIMEOUT_MS);
         HAL_GPIO_WritePin(_directionPort, _directionPin,
                         transmitLevel == GPIO_PIN_SET ? GPIO_PIN_RESET : GPIO_PIN_SET);
@@ -362,7 +381,16 @@ bool Modbus::_serialSend(const uint8_t* data, size_t len)
             usleep(parameters.TRANSMIT_DELAY_US); // Bus Turnaround Delay
         }
     #else
+        if (_transport != nullptr)
+        {
+            if (_transport->send(data, static_cast<uint16_t>(len), parameters.BAUDRATE,
+                                 parameters.RESPONSE_TIMEOUT_MS))
+                return true;
+            setError("UART interrupt transmit failed.");
+            return false;
+        }
         HAL_GPIO_WritePin(_directionPort, _directionPin, _transmitLevel);
+        _serial->setTimeout(parameters.RESPONSE_TIMEOUT_MS);
         const uint16_t written = _serial->write(const_cast<uint8_t*>(data), static_cast<uint16_t>(len));
         if (written != len)
         {
@@ -371,13 +399,7 @@ bool Modbus::_serialSend(const uint8_t* data, size_t len)
             setError("UART transmit failed.");
             return false;
         }
-        if (!_serial->flush(parameters.RESPONSE_TIMEOUT_MS))
-        {
-            HAL_GPIO_WritePin(_directionPort, _directionPin,
-                            _transmitLevel == GPIO_PIN_SET ? GPIO_PIN_RESET : GPIO_PIN_SET);
-            setError("UART transmit timeout.");
-            return false;
-        }
+        // In blocking mode HAL_UART_Transmit already waits for TC (last stop bit).
         HAL_GPIO_WritePin(_directionPort, _directionPin,
                         _transmitLevel == GPIO_PIN_SET ? GPIO_PIN_RESET : GPIO_PIN_SET);
     #endif
@@ -426,6 +448,13 @@ size_t Modbus::_serialReceive(size_t expected_length, uint8_t* buffer)
         setError(oss.str().c_str());
         return 0;
     #else
+        if (_transport != nullptr)
+        {
+            if (_transport->read(buffer, static_cast<uint16_t>(expected_length), parameters.RESPONSE_TIMEOUT_MS))
+                return expected_length;
+            setError("UART interrupt receive failed.");
+            return 0;
+        }
         _serial->setTimeout(parameters.RESPONSE_TIMEOUT_MS);
         const size_t received = _serial->readBytes(reinterpret_cast<char*>(buffer), expected_length);
         if (received == expected_length) return received;
@@ -520,6 +549,13 @@ ModbusBuffer<uint8_t> Modbus::_serialReceive(size_t n, uint32_t timeout_ms)
         return out;
     #else
         ModbusBuffer<uint8_t> out(n);
+        if (_transport != nullptr)
+        {
+            if (_transport->read(out.data(), static_cast<uint16_t>(n), timeout_ms))
+                return out;
+            setError("UART interrupt receive failed.");
+            return {};
+        }
         _serial->setTimeout(timeout_ms);
         const size_t received = _serial->readBytes(reinterpret_cast<char*>(out.data()), n);
         if (received != n)
@@ -583,6 +619,12 @@ ModbusBuffer<uint8_t> Modbus::_receiveRtuResponse(uint8_t expected_slave,
             return (uint32_t)rem;
         };
     #else
+        struct ReceiveGuard
+        {
+            ModbusMCUInterruptTransport* transport;
+            ~ReceiveGuard() { if (transport != nullptr) transport->finishReceive(); }
+        } receiveGuard{_transport};
+
         // HAL_GetTick() is a 32-bit millisecond counter and wraps about every 49.7 days.
         // Unsigned subtraction yields the correct elapsed time across that single wrap.
         const uint32_t start_tick = static_cast<uint32_t>(now_ms());

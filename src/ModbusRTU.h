@@ -126,6 +126,7 @@
 
 #if !defined(_PLATFORM_PC_)
     #include "Serial.h"
+    class ModbusMCUInterruptTransport;
 #endif
 
 // ######################################################################################
@@ -257,6 +258,15 @@ class Modbus
              */
             bool begin(Serial* serial, GPIO_TypeDef* directionPort, uint16_t directionPin,
                         GPIO_PinState transmitLevel = GPIO_PIN_SET);
+
+            /**
+             * @brief Use interrupt TX/RX on the UART configured by begin().
+             * @param transport Transport dedicated to this bus. It must outlive
+             *                  its use by the Modbus instance and UART callbacks.
+             * @return true if the port is open and the transport was attached.
+             * @pre Call while the bus is idle, before issuing Modbus requests.
+             */
+    bool enableMCUInterruptTransport(ModbusMCUInterruptTransport& transport) noexcept;
         #endif
         
         /**
@@ -515,6 +525,7 @@ class Modbus
         int _serialPort{-1};
         #if !defined(_PLATFORM_PC_)
             Serial* _serial{nullptr};                 /**< Non-owning project Serial wrapper. */
+            ModbusMCUInterruptTransport* _transport{nullptr}; /**< Optional interrupt backend. */
             GPIO_TypeDef* _directionPort{nullptr};    /**< Half-duplex transceiver direction GPIO port. */
             uint16_t _directionPin{0};                /**< Transceiver direction GPIO pin mask. */
             GPIO_PinState _transmitLevel{GPIO_PIN_SET}; /**< Logic level selecting TX mode. */

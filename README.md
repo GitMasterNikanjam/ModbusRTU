@@ -31,6 +31,8 @@ The physical interface is supplied by the serial hardware and its driver. Linux 
 
 ### STM32 UART and half-duplex transceiver setup
 
+For STM32 builds, compile `src/ModbusRTU.cpp` and `src/ModbusMCUInterruptTransport.cpp`.
+
 Connect the MCU UART TX/RX to the RS-485 transceiver TXD/RXD. Connect one MCU GPIO to the transceiver direction input (DE and `/RE` tied together if the transceiver requires both). The library drives that GPIO to `transmitLevel` during TX and to the opposite level for RX.
 
 The UART must already be initialized by the application. Configure the project `Serial` object for the selected UART and call:
@@ -45,7 +47,71 @@ modbus.parameters.BAUDRATE = 115200; // Serial_STM32 supports 9600, 57600, 11520
 modbus.begin(&uartSerial, TRANSCEIVER_DIR_GPIO_Port, TRANSCEIVER_DIR_Pin, GPIO_PIN_SET);
 ```
 
-Set parity, word length, and stop bits in the Cube/HAL UART configuration to match the slave. Use blocking TX/RX modes; `Modbus::begin()` selects those modes on the supplied `Serial` object. On STM32, `openPort()` is retained for API compatibility and returns the state established by `begin()`.
+Set parity, word length, and stop bits in the Cube/HAL UART configuration to match the slave. `Modbus::begin()` selects blocking TX/RX on the supplied `Serial` object. On STM32, `openPort()` returns the state established by `begin()`.
+
+#### Optional interrupt transport
+
+For interrupt TX/RX, include `ModbusMCUInterruptTransport.h`, create one transport object per bus, and call `modbus.enableMCUInterruptTransport(transport)` after a successful `begin()`. The transport object must outlive its registration and UART callbacks.
+
+The following bare-metal example shows setup, HAL callback forwarding, and a register read. Replace the UART and direction pin names with those generated for your board.
+
+```cpp
+#include "ModbusRTU.h"
+#include "ModbusMCUInterruptTransport.h"
+#include "main.h"
+
+// These objects must remain alive while the Modbus bus is in use.
+static Serial modbusSerial;
+static Modbus modbus;
+static ModbusMCUInterruptTransport modbusInterruptTransport;
+
+bool initializeModbus()
+{
+    modbusSerial.setUart(&huart2);
+    modbus.parameters.BAUDRATE = 115200;
+    modbus.parameters.RESPONSE_TIMEOUT_MS = 100;
+
+    if (!modbus.begin(&modbusSerial, RS485_DIR_GPIO_Port,
+                      RS485_DIR_Pin, GPIO_PIN_SET))
+        return false;
+
+    // Register the interrupt transport after begin() configured the UART.
+    return modbus.enableMCUInterruptTransport(modbusInterruptTransport);
+}
+
+extern "C" void HAL_UART_TxCpltCallback(UART_HandleTypeDef* uart)
+{
+    if (uart == &huart2)
+        modbusInterruptTransport.TxCpltCallback(uart);
+}
+
+extern "C" void HAL_UART_RxCpltCallback(UART_HandleTypeDef* uart)
+{
+    if (uart == &huart2)
+        modbusInterruptTransport.RxCpltCallback(uart);
+}
+
+extern "C" void HAL_UART_ErrorCallback(UART_HandleTypeDef* uart)
+{
+    if (uart == &huart2)
+        modbusInterruptTransport.ErrorCallback(uart);
+}
+
+void readDriveStatus()
+{
+    uint16_t registers[2]{};
+    if (modbus.readHoldingRegisters(1, 0x0000, 2, registers))
+    {
+        // Use registers[0] and registers[1].
+    }
+    else
+    {
+        // Inspect modbus.errorMessage.
+    }
+}
+```
+
+Call `initializeModbus()` after HAL has initialized `huart2`. Call `readDriveStatus()` from the main context, never from an ISR. The UART bytes are moved by interrupts, while the Modbus API call waits for the response or timeout. Without RTOS hooks, that wait uses WFI. In an RTOS application, register a persistent `WaitHooks` table while the bus is idle so the owner task can wait on notifications. Keep requests serialized and keep UART and HAL tick interrupts enabled during a transaction.
 
 ### Broadcast writes
 
